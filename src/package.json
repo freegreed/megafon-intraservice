@@ -1,0 +1,17 @@
+{
+  "name": "megafon-intraservice",
+  "version": "1.0.0",
+  "description": "МегаФон ВАТС → Cloudflare Worker → IntraService: webhook-обработчик для создания заявок по входящим звонкам",
+  "main": "src/worker.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:create": "wrangler d1 create megafon-intraservice",
+    "db:init": "wrangler d1 execute megafon-intraservice --file=schema.sql",
+    "db:query": "wrangler d1 execute megafon-intraservice --command",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
