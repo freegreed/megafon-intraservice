@@ -1,0 +1,31 @@
+name = "megafon-intraservice"
+main = "src/worker.js"
+compatibility_date = "2025-09-01"
+workers_dev = true
+
+# D1 привязка — раскомментируйте после создания базы (см. README, Шаг 4)
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "megafon-intraservice"
+# database_id = "ЗАМЕНИТЕ_НА_ID_ВАШЕЙ_D1"
+
+# Cron Trigger — контрольная сверка каждые 30 минут
+# Раскомментируйте после завершения базовой настройки
+# [triggers]
+# crons = ["*/30 * * * *"]
+
+# Секреты (не хранятся в коде, задаются через Wrangler):
+#   MEGAFON_CRM_TOKEN   — crm_token из МегаФона
+#   WEBHOOK_SECRET_PATH — случайный путь в URL webhook-а
+#   INTRASERVICE_URL    — базовый URL вашего IntraService (https://help.example.ru)
+#   INTRASERVICE_LOGIN  — логин учётной записи «Интеграция МегаФон»
+#   INTRASERVICE_PASSWORD — пароль учётной записи «Интеграция МегаФон»
+#   MEGAFON_API_URL     — URL API МегаФона (https://atlas.megafon.ru)
+#   MEGAFON_API_TOKEN   — токен API МегаФона
+#
+# IntraService — ID сервиса, типа, приоритета, статуса, исполнителя
+#   IS_SERVICE_ID
+#   IS_TYPE_ID
+#   IS_PRIORITY_ID
+#   IS_STATUS_DONE_ID
+#   IS_EXECUTOR_ID
