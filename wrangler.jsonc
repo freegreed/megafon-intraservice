@@ -12,7 +12,7 @@
     {
       "binding": "DB",
       "database_name": "megafon-intraservice",
-      "database_id": "REPLACE_WITH_D1_DATABASE_ID"
+      "database_id": "ea1c5ad2-1a8e-404d-a2b2-bebdba22e8c5"
     }
   ],
   "triggers": {
