@@ -19,7 +19,6 @@ const MAX_ATTEMPTS = 5;
 const RETRY_MINUTES = 5;
 const MAX_BODY_BYTES = 64 * 1024;
 
-// Параметры проекта IntraService, подтверждённые в текущем чате.
 const IS_SERVICE_ID = 619;
 const IS_TYPE_ID = 1024;
 const IS_PRIORITY_ID = 11;
@@ -70,7 +69,6 @@ export default {
       return json({ result: "rejected", reason: call.reason }, 400);
     }
 
-    // Persist first. This is the durability boundary before background work.
     const inserted = await insertCallIfAbsent(env, call.data);
 
     if (!inserted) {
@@ -78,7 +76,6 @@ export default {
       return json({ result: "duplicate", callid: call.data.callid }, 200);
     }
 
-    // Do not make MegaFon wait for IntraService. D1 already contains the event.
     ctx.waitUntil(processClaimedCall(env, call.data.callid));
 
     return json({ result: "accepted", callid: call.data.callid }, 200);
@@ -251,15 +248,17 @@ async function createIntraServiceTask(env, { phone, duration, recordUrl, callid,
   const url = `${baseUrl}/api/task`;
   const auth = btoa(`${env.INTRASERVICE_LOGIN}:${env.INTRASERVICE_PASSWORD}`);
 
+  // IntraService Description behaves as plain text in the current deployment.
+  // Use real newlines instead of HTML <br>, which was displayed literally.
   const description = [
     `Номер клиента: ${phone || "не указан"}`,
     `Длительность: ${duration} сек.`,
     `Call ID: ${callid}`,
     `Время: ${callStart || "не указано"}`,
     recordUrl
-      ? `Запись разговора: <a href="${escapeHtmlAttribute(recordUrl)}">Открыть запись</a>`
+      ? `Запись разговора: ${recordUrl}`
       : "Запись разговора отсутствует",
-  ].join("<br>");
+  ].join("\n");
 
   const body = {
     Name: `Звонок от ${phone || "неизвестного номера"}`,
@@ -285,8 +284,6 @@ async function createIntraServiceTask(env, { phone, duration, recordUrl, callid,
   const responseText = await response.text();
 
   if (!response.ok) {
-    // Do not log Authorization or any other secret. The response body is limited
-    // because it is stored in the D1 error table and Cloudflare logs.
     const details = responseText.replace(/\s+/g, " ").trim().slice(0, 450);
     throw new Error(
       `IntraService HTTP ${response.status}${details ? `: ${details}` : ""}`,
@@ -393,7 +390,28 @@ async function logError(env, callid, errorType, message) {
 }
 
 function normalizePhone(value) {
-  return String(value ?? "").trim();
+  const original = String(value ?? "").trim();
+  if (!original) return "";
+
+  const digits = original.replace(/\D/g, "");
+
+  // Russian 10-digit national number: 9991234567 -> +79991234567.
+  if (digits.length === 10 && digits.startsWith("9")) {
+    return `+7${digits}`;
+  }
+
+  // Russian number with leading 8: 89991234567 -> +79991234567.
+  if (digits.length === 11 && digits.startsWith("8")) {
+    return `+7${digits.slice(1)}`;
+  }
+
+  // Already in Russian international form: 79991234567 -> +79991234567.
+  if (digits.length === 11 && digits.startsWith("7")) {
+    return `+${digits}`;
+  }
+
+  // Do not corrupt non-Russian/incomplete values.
+  return original;
 }
 
 function safeUrl(value) {
@@ -417,14 +435,6 @@ function requireHttpsBaseUrl(value) {
   const url = new URL(String(value || ""));
   if (url.protocol !== "https:") throw new Error("INTRASERVICE_URL must use HTTPS");
   return url.toString().replace(/\/$/, "");
-}
-
-function escapeHtmlAttribute(value) {
-  return String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;");
 }
 
 function safeErrorMessage(error) {
