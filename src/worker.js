@@ -1,26 +1,20 @@
 /**
  * МегаФон ВАТС → Cloudflare Worker → D1 → IntraService
  *
- * Production rules:
- * - принимает только POST на точный секретный webhook path;
- * - проверяет crm_token;
- * - обрабатывает только cmd=history, type=in, status=success;
- * - создаёт заявку только если duration > 10 секунд;
- * - сохраняет callid до фоновой обработки;
- * - использует D1 как идемпотентное хранилище и очередь retry;
- * - никогда не пишет секреты в логи.
+ * Current integration contract is deliberately limited to data confirmed in
+ * this project: IntraService service 619, task type 1024, low priority 11,
+ * completed status 29, applicant/service user 1744.
  *
- * Важное ограничение текущей версии:
- * синхронизация сотрудников через MegaFon REST API сознательно вынесена
- * в отдельный адаптер. Формат ответа GET /crmapi/v1/users известен,
- * но способ авторизации API должен быть подтверждён на конкретной ВАТС
- * до включения автоматической синхронизации.
+ * MegaFon history webhooks are accepted as either application/x-www-form-urlencoded
+ * (native CRM integration format) or JSON. The canonical MegaFon field names are
+ * callid and link; uid/record are retained only as compatibility aliases.
  */
 
 const MIN_DURATION_SEC = 10;
 const MAX_ATTEMPTS = 5;
 const RETRY_MINUTES = 5;
 const MAX_BODY_BYTES = 64 * 1024;
+const STALE_PROCESSING_MINUTES = 10;
 
 export default {
   async fetch(request, env, ctx) {
@@ -34,19 +28,17 @@ export default {
       return json({ error: "Method Not Allowed" }, 405);
     }
 
-    const expectedPath = `/webhook/megafon/${env.WEBHOOK_SECRET_PATH}`;
+    const expectedPath = `/webhook/megafon/${env.WEBHOOK_SECRET_PATH || ""}`;
     if (!env.WEBHOOK_SECRET_PATH || url.pathname !== expectedPath) {
       return json({ error: "Not Found" }, 404);
     }
 
-    const contentLength = Number(request.headers.get("content-length") || 0);
-    if (contentLength > MAX_BODY_BYTES) {
-      return json({ error: "Payload Too Large" }, 413);
-    }
-
-    const contentType = request.headers.get("content-type") || "";
-    if (!contentType.toLowerCase().includes("application/json")) {
-      return json({ error: "Content-Type must be application/json" }, 415);
+    const contentLengthHeader = request.headers.get("content-length");
+    if (contentLengthHeader) {
+      const contentLength = Number(contentLengthHeader);
+      if (!Number.isFinite(contentLength) || contentLength > MAX_BODY_BYTES) {
+        return json({ error: "Payload Too Large" }, 413);
+      }
     }
 
     let payload;
@@ -55,9 +47,9 @@ export default {
       if (new TextEncoder().encode(raw).byteLength > MAX_BODY_BYTES) {
         return json({ error: "Payload Too Large" }, 413);
       }
-      payload = JSON.parse(raw);
+      payload = parseWebhookBody(raw, request.headers.get("content-type") || "");
     } catch {
-      return json({ error: "Invalid JSON" }, 400);
+      return json({ error: "Invalid request body" }, 400);
     }
 
     if (payload?.crm_token !== env.MEGAFON_CRM_TOKEN) {
@@ -71,7 +63,6 @@ export default {
       return json({ result: "rejected", reason: call.reason }, 400);
     }
 
-    // Persist first. This is the durability boundary before background work.
     const inserted = await insertCallIfAbsent(env, call.data);
 
     if (!inserted) {
@@ -79,7 +70,8 @@ export default {
       return json({ result: "duplicate", callid: call.data.callid }, 200);
     }
 
-    // Do not make MegaFon wait for IntraService. D1 already contains the event.
+    // D1 is the durability boundary. If waitUntil is interrupted, the Cron
+    // handler also recovers stale PROCESSING rows.
     ctx.waitUntil(processClaimedCall(env, call.data.callid));
 
     return json({ result: "accepted", callid: call.data.callid }, 200);
@@ -87,26 +79,38 @@ export default {
 
   async scheduled(_controller, env, ctx) {
     ctx.waitUntil(retryFailedCalls(env));
-    // Employee synchronization is intentionally disabled until the exact
-    // MegaFon API authentication for the customer's VATS is verified.
+    ctx.waitUntil(recoverStaleProcessing(env));
   },
 };
 
+function parseWebhookBody(raw, contentType) {
+  const normalizedType = contentType.toLowerCase();
+
+  if (normalizedType.includes("application/json")) {
+    return JSON.parse(raw);
+  }
+
+  if (normalizedType.includes("application/x-www-form-urlencoded")) {
+    return Object.fromEntries(new URLSearchParams(raw).entries());
+  }
+
+  throw new Error("Unsupported Content-Type");
+}
+
 function parseHistoryPayload(payload) {
-  const cmd = String(payload?.cmd || "").toLowerCase();
-  const type = String(payload?.type || "").toLowerCase();
-  const status = String(payload?.status || "").toLowerCase();
-  const callid = String(payload?.uid || payload?.callid || "").trim();
+  const cmd = String(payload?.cmd || "").trim().toLowerCase();
+  const type = String(payload?.type || "").trim().toLowerCase();
+  const status = String(payload?.status || "").trim().toLowerCase();
+  const callid = String(payload?.callid || payload?.uid || "").trim();
 
   if (cmd !== "history") {
     return { ok: false, reason: "Unsupported command" };
   }
 
   if (!callid) {
-    return { ok: false, reason: "Missing uid/callid" };
+    return { ok: false, reason: "Missing callid" };
   }
 
-  // The MegaFon history contract uses type=in/out and status=success/missed.
   if (type !== "in") {
     return { ok: true, data: skippedCall(payload, callid, "not incoming") };
   }
@@ -132,7 +136,7 @@ function parseHistoryPayload(payload) {
       phone: normalizePhone(payload?.phone),
       megafon_user: user,
       duration,
-      record_url: safeUrl(payload?.record),
+      record_url: safeUrl(payload?.link || payload?.record),
       call_start: String(payload?.start || "").trim(),
       call_type: type,
       call_status: status,
@@ -147,10 +151,10 @@ function skippedCall(payload, callid, reason, durationOverride) {
     phone: normalizePhone(payload?.phone),
     megafon_user: String(payload?.user || "").trim(),
     duration: durationOverride ?? parseNonNegativeInt(payload?.duration),
-    record_url: safeUrl(payload?.record),
+    record_url: safeUrl(payload?.link || payload?.record),
     call_start: String(payload?.start || "").trim(),
     call_type: String(payload?.type || "").trim(),
-    call_status: String(payload?.status || "").trim(),
+    call_status: String(payload?.status || "").trim().toLowerCase(),
     status: "SKIPPED",
     error_type: "FILTER",
     error_message: reason,
@@ -203,18 +207,13 @@ async function processClaimedCall(env, callid) {
   }
 
   try {
-    const mapping = await findActiveMapping(env, row.megafon_user);
-    if (!mapping || !mapping.intraservice_user_id) {
-      throw new Error(`No active IntraService mapping for MegaFon user: ${row.megafon_user}`);
-    }
-
     const taskId = await createIntraServiceTask(env, {
       phone: row.phone,
       duration: row.duration,
       recordUrl: row.record_url,
       callid: row.callid,
       callStart: row.call_start,
-      creatorId: mapping.intraservice_user_id,
+      creatorId: env.IS_CREATOR_ID,
     });
 
     if (!taskId) {
@@ -238,13 +237,14 @@ async function processClaimedCall(env, callid) {
 async function createIntraServiceTask(env, { phone, duration, recordUrl, callid, callStart, creatorId }) {
   const baseUrl = requireHttpsBaseUrl(env.INTRASERVICE_URL);
   const url = `${baseUrl}/api/task`;
-  const auth = btoa(`${env.INTRASERVICE_LOGIN}:${env.INTRASERVICE_PASSWORD}`);
+  const auth = btoa(`${requiredString(env.INTRASERVICE_LOGIN, "INTRASERVICE_LOGIN")}:${requiredString(env.INTRASERVICE_PASSWORD, "INTRASERVICE_PASSWORD")}`);
 
   const description = [
     `Номер клиента: ${phone || "не указан"}`,
     `Длительность: ${duration} сек.`,
     `Call ID: ${callid}`,
     `Время: ${callStart || "не указано"}`,
+    `Оператор ВАТС: ${escapeHtml(String(env.CURRENT_OPERATOR_LABEL || "не указан"))}`,
     recordUrl
       ? `Запись разговора: <a href="${escapeHtmlAttribute(recordUrl)}">Открыть запись</a>`
       : "Запись разговора отсутствует",
@@ -257,8 +257,7 @@ async function createIntraServiceTask(env, { phone, duration, recordUrl, callid,
     TypeId: requiredInt(env.IS_TYPE_ID, "IS_TYPE_ID"),
     PriorityId: requiredInt(env.IS_PRIORITY_ID, "IS_PRIORITY_ID"),
     StatusId: requiredInt(env.IS_STATUS_DONE_ID, "IS_STATUS_DONE_ID"),
-    CreatorId: requiredInt(creatorId, "CreatorId"),
-    ExecutorIds: String(requiredInt(env.IS_EXECUTOR_ID, "IS_EXECUTOR_ID")),
+    CreatorId: requiredInt(creatorId, "IS_CREATOR_ID"),
   };
 
   const response = await fetch(url, {
@@ -277,22 +276,19 @@ async function createIntraServiceTask(env, { phone, duration, recordUrl, callid,
     throw new Error(`IntraService HTTP ${response.status}`);
   }
 
-  let data;
-  try {
-    data = responseText ? JSON.parse(responseText) : {};
-  } catch {
-    throw new Error("IntraService returned non-JSON response");
-  }
-
-  return data.Id ?? data.id ?? data.TaskId ?? data.task_id ?? data.task?.Id ?? null;
+  return extractTaskId(responseText);
 }
 
-async function findActiveMapping(env, megafonLogin) {
-  return env.DB.prepare(
-    `SELECT intraservice_user_id, intraservice_name
-     FROM users_mapping
-     WHERE megafon_login = ? AND active = 1 AND mapping_status = 'MATCHED'`
-  ).bind(megafonLogin).first();
+function extractTaskId(responseText) {
+  if (!responseText) return null;
+
+  try {
+    const data = JSON.parse(responseText);
+    return data.Id ?? data.id ?? data.TaskId ?? data.task_id ?? data.Task?.Id ?? data.task?.Id ?? null;
+  } catch {
+    const xmlMatch = responseText.match(/<Id>\s*(\d+)\s*<\/Id>/i);
+    return xmlMatch ? Number(xmlMatch[1]) : null;
+  }
 }
 
 async function retryFailedCalls(env) {
@@ -309,6 +305,19 @@ async function retryFailedCalls(env) {
   for (const row of rows.results || []) {
     await processRetry(env, row.callid);
   }
+}
+
+async function recoverStaleProcessing(env) {
+  await env.DB.prepare(
+    `UPDATE calls
+     SET status = 'RETRY',
+         error_type = 'RECOVERY',
+         error_message = 'Recovered stale PROCESSING state',
+         next_retry_at = datetime('now'),
+         updated_at = datetime('now')
+     WHERE status = 'PROCESSING'
+       AND updated_at <= datetime('now', ? || ' minutes')`
+  ).bind(`-${STALE_PROCESSING_MINUTES}`).run();
 }
 
 async function processRetry(env, callid) {
@@ -329,18 +338,13 @@ async function processRetry(env, callid) {
   if (!row) return;
 
   try {
-    const mapping = await findActiveMapping(env, row.megafon_user);
-    if (!mapping || !mapping.intraservice_user_id) {
-      throw new Error(`No active IntraService mapping for MegaFon user: ${row.megafon_user}`);
-    }
-
     const taskId = await createIntraServiceTask(env, {
       phone: row.phone,
       duration: row.duration,
       recordUrl: row.record_url,
       callid: row.callid,
       callStart: row.call_start,
-      creatorId: mapping.intraservice_user_id,
+      creatorId: env.IS_CREATOR_ID,
     });
 
     if (!taskId) throw new Error("IntraService task ID missing");
@@ -415,6 +419,12 @@ function requiredInt(value, name) {
   return number;
 }
 
+function requiredString(value, name) {
+  const text = String(value ?? "").trim();
+  if (!text) throw new Error(`${name} is required`);
+  return text;
+}
+
 function requireHttpsBaseUrl(value) {
   const url = new URL(String(value || ""));
   if (url.protocol !== "https:") throw new Error("INTRASERVICE_URL must use HTTPS");
@@ -425,6 +435,13 @@ function escapeHtmlAttribute(value) {
   return String(value)
     .replaceAll("&", "&amp;")
     .replaceAll('"', "&quot;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;");
 }
