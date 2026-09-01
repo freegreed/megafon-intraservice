@@ -1,23 +1,34 @@
 # Пошаговая установка
 
-## Этап 0. Ничего не деплоить
+## Этап 0. Проверяем конфигурацию
 
-Сначала получаем:
+Подтверждённые параметры текущей интеграции:
 
-- реальный URL IntraService;
-- параметры сервиса «Звонки»;
-- права интеграционной учётки;
-- реальный пример MegaFon `history` webhook;
-- подтверждение API-доступа MegaFon.
+```text
+IntraService URL: https://yfo-skfo.intraservice.ru
+ServiceId:        619   («Звонки»)
+TypeId:           1024
+PriorityId:       11    («Низкий»)
+StatusId:         29    («Выполнена»)
+CreatorId:        1744  («Служебный аккаунт», роль «Клиент»)
+```
+
+ID исполнителя не задаётся: в текущем чате он не подтверждён.
 
 ## Этап 1. Cloudflare
 
-На компьютере достаточно Node.js LTS и VS Code. Production-сервер не нужен.
+На компьютере достаточно Node.js LTS и VS Code.
 
 Установить зависимости:
 
 ```bash
 npm install
+```
+
+Запустить регрессионные тесты:
+
+```bash
+npm test
 ```
 
 Авторизовать Wrangler:
@@ -60,22 +71,16 @@ npx wrangler d1 execute megafon-intraservice --remote --command="SELECT name FRO
 
 ## Этап 3. Secrets
 
-Задать секреты:
+Задать только секреты:
 
 ```bash
 npx wrangler secret put MEGAFON_CRM_TOKEN
 npx wrangler secret put WEBHOOK_SECRET_PATH
-npx wrangler secret put INTRASERVICE_URL
 npx wrangler secret put INTRASERVICE_LOGIN
 npx wrangler secret put INTRASERVICE_PASSWORD
-npx wrangler secret put IS_SERVICE_ID
-npx wrangler secret put IS_TYPE_ID
-npx wrangler secret put IS_PRIORITY_ID
-npx wrangler secret put IS_STATUS_DONE_ID
-npx wrangler secret put IS_EXECUTOR_ID
 ```
 
-Значения секретов не отправлять в чат и не коммитить в Git.
+Секреты не отправлять в чат и не коммитить в Git.
 
 ## Этап 4. Первый deploy
 
@@ -97,17 +102,32 @@ GET https://<worker>/health
 {"status":"ok","service":"megafon-intraservice"}
 ```
 
-## Этап 5. MegaFon
-
-В CRM-интеграции ВАТС указать webhook URL:
+Webhook URL:
 
 ```text
 https://<worker>/webhook/megafon/<WEBHOOK_SECRET_PATH>
 ```
 
-Тип события: `history`.
+## Этап 5. МегаФон ВАТС
 
-Не включать production-события до тестового звонка и проверки payload.
+В настройках интеграции CRM вашей ВАТС указать webhook URL Worker.
+
+Для `history` Worker ожидает стандартные поля:
+
+```text
+cmd=history
+type=in
+status=Success
+user=<оператор>
+phone=<номер>
+start=<время>
+duration=<секунды>
+callid=<уникальный ID>
+link=<HTTPS запись>
+crm_token=<ключ>
+```
+
+Нативный формат МегаФон — `application/x-www-form-urlencoded`; Worker также принимает JSON.
 
 ## Этап 6. Тестовый звонок
 
@@ -125,35 +145,21 @@ npx wrangler tail
 npx wrangler d1 execute megafon-intraservice --remote --command="SELECT callid, phone, megafon_user, duration, status, intraservice_task_id FROM calls ORDER BY id DESC LIMIT 20;"
 ```
 
-## Этап 7. IntraService
+## Этап 7. Контроль создания заявки
 
-Перед первым реальным звонком определить через API вашей версии IntraService:
+Ожидаемая заявка:
 
-- ServiceId сервиса «Звонки»;
-- TypeId типа заявки;
-- PriorityId;
-- StatusId «Выполнена»;
-- User.Id системной учётки «Интеграция МегаФон»;
-- User.Id операторов.
-
-Сначала создать одну тестовую заявку через API и убедиться, что поля `CreatorId` и `ExecutorIds` принимаются вашей версией API.
-
-## Этап 8. Сопоставление сотрудников
-
-После получения реального списка MegaFon users и списка IntraService users заполнить `users_mapping`.
-
-Пример:
-
-```sql
-INSERT INTO users_mapping
-(megafon_login, megafon_name, email, intraservice_user_id, intraservice_name, active, mapping_status)
-VALUES
-('ivan', 'Иванов Иван', 'ivanov@example.ru', 152, 'Иванов Иван', 1, 'MATCHED');
+```text
+Сервис:     619 — «Звонки»
+Тип:        1024
+Приоритет:  11 — «Низкий»
+Статус:     29 — «Выполнена»
+Заявитель:  1744 — «Служебный аккаунт»
 ```
 
-Автоматическую синхронизацию включаем только после подтверждения API authentication.
+Исполнитель не задаётся API-интеграцией.
 
-## Этап 9. Финальные тесты
+## Этап 8. Финальные тесты
 
 Проверить:
 
@@ -163,9 +169,11 @@ VALUES
 - входящий успешный → заявка есть;
 - пропущенный → заявки нет;
 - исходящий → заявки нет;
-- неизвестный оператор → заявка не создаётся от неправильного пользователя;
-- повтор webhook → второй заявки нет;
+- повтор одного `callid` → второй заявки нет;
 - временная ошибка IntraService → retry;
 - 5 неудачных попыток → `ERROR`;
+- зависший `PROCESSING` более 10 минут → восстановление в `RETRY`;
 - отсутствующая запись → заявка всё равно создаётся;
 - HTTPS запись → ссылка попадает в описание.
+
+Фактическое создание заявки в вашей production-системе нельзя считать подтверждённым до выполнения тестового звонка с реальными секретами.

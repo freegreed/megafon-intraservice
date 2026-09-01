@@ -26,23 +26,6 @@ CREATE INDEX IF NOT EXISTS idx_calls_status_retry
 CREATE INDEX IF NOT EXISTS idx_calls_task
   ON calls(intraservice_task_id);
 
-CREATE TABLE IF NOT EXISTS users_mapping (
-  megafon_login TEXT PRIMARY KEY,
-  megafon_name TEXT,
-  email TEXT,
-  intraservice_user_id INTEGER,
-  intraservice_name TEXT,
-  active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1)),
-  mapping_status TEXT NOT NULL DEFAULT 'PENDING',
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_users_mapping_email
-  ON users_mapping(email);
-
-CREATE INDEX IF NOT EXISTS idx_users_mapping_active
-  ON users_mapping(active, mapping_status);
-
 CREATE TABLE IF NOT EXISTS errors (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   callid TEXT,
@@ -54,14 +37,3 @@ CREATE TABLE IF NOT EXISTS errors (
 
 CREATE INDEX IF NOT EXISTS idx_errors_callid
   ON errors(callid, created_at);
-
-CREATE TABLE IF NOT EXISTS sync_runs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  operation TEXT NOT NULL,
-  status TEXT NOT NULL,
-  details TEXT,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_sync_runs_operation
-  ON sync_runs(operation, created_at);
