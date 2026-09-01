@@ -39,8 +39,11 @@ export default {
       return json({ error: "Method Not Allowed" }, 405);
     }
 
-    const expectedPath = `/webhook/megafon/${env.WEBHOOK_SECRET_PATH}`;
-    if (!env.WEBHOOK_SECRET_PATH || url.pathname !== expectedPath) {
+    const webhookSecretPath = String(env.WEBHOOK_SECRET_PATH || "")
+      .trim()
+      .replace(/^\/+|\/+$/g, "");
+    const expectedPath = `/webhook/megafon/${webhookSecretPath}`;
+    if (!webhookSecretPath || url.pathname !== expectedPath) {
       return json({ error: "Not Found" }, 404);
     }
 
