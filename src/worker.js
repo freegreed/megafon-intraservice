@@ -213,6 +213,7 @@ async function processClaimedCall(env, callid) {
       recordUrl: row.record_url,
       callid: row.callid,
       callStart: row.call_start,
+      operator: row.megafon_user,
       creatorId: env.IS_CREATOR_ID,
     });
 
@@ -234,7 +235,7 @@ async function processClaimedCall(env, callid) {
   }
 }
 
-async function createIntraServiceTask(env, { phone, duration, recordUrl, callid, callStart, creatorId }) {
+async function createIntraServiceTask(env, { phone, duration, recordUrl, callid, callStart, operator, creatorId }) {
   const baseUrl = requireHttpsBaseUrl(env.INTRASERVICE_URL);
   const url = `${baseUrl}/api/task`;
   const auth = btoa(`${requiredString(env.INTRASERVICE_LOGIN, "INTRASERVICE_LOGIN")}:${requiredString(env.INTRASERVICE_PASSWORD, "INTRASERVICE_PASSWORD")}`);
@@ -244,7 +245,7 @@ async function createIntraServiceTask(env, { phone, duration, recordUrl, callid,
     `Длительность: ${duration} сек.`,
     `Call ID: ${callid}`,
     `Время: ${callStart || "не указано"}`,
-    `Оператор ВАТС: ${escapeHtml(String(env.CURRENT_OPERATOR_LABEL || "не указан"))}`,
+    `Оператор ВАТС: ${escapeHtml(operator || "не указан")}`,
     recordUrl
       ? `Запись разговора: <a href="${escapeHtmlAttribute(recordUrl)}">Открыть запись</a>`
       : "Запись разговора отсутствует",
@@ -344,6 +345,7 @@ async function processRetry(env, callid) {
       recordUrl: row.record_url,
       callid: row.callid,
       callStart: row.call_start,
+      operator: row.megafon_user,
       creatorId: env.IS_CREATOR_ID,
     });
 
