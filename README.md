@@ -1,61 +1,58 @@
 # МегаФон ВАТС → IntraService
 
-Serverless-интеграция на Cloudflare Workers + D1.
+Интеграция принимает историю звонков МегаФон ВАТС, сохраняет событие в Cloudflare D1 и создаёт заявку через REST API IntraService.
 
-## Целевая схема
+## Подтверждённая конфигурация IntraService
+
+| Параметр | Значение |
+|---|---:|
+| Сервис «Звонки» | `619` |
+| Тип заявки | `1024` |
+| Приоритет | `11` — низкий |
+| Статус | `29` — «Выполнена» |
+| Заявитель | `1744` — «Служебный аккаунт», системная роль «Клиент» |
+| IntraService URL | `https://yfo-skfo.intraservice.ru` |
+
+Эти значения взяты только из текущего проекта и предоставленных в этом чате данных. Не использовать значения из других проектов.
+
+## Входящий webhook МегаФон
+
+Основной формат REST-интеграции МегаФон — `application/x-www-form-urlencoded`. Worker также принимает JSON как совместимый вариант.
+
+Для команды `history` используются поля:
+
+- `cmd=history`;
+- `type=in` — входящий звонок;
+- `status=Success` — успешный звонок;
+- `user` — идентификатор пользователя ВАТС;
+- `phone` — номер клиента;
+- `start` — время начала;
+- `duration` — длительность;
+- `callid` — уникальный ID звонка;
+- `link` — ссылка на запись разговора;
+- `crm_token` — ключ CRM.
+
+Worker принимает только успешные входящие звонки длительностью **более 10 секунд**. `callid` является уникальным ключом, поэтому повтор одного webhook не создаёт вторую заявку.
+
+## Создание заявки
+
+Worker отправляет `POST /api/task` в IntraService с Basic Authentication. API IntraService работает с Basic Authentication и для создания заявки принимает поля объекта Task. citeturn6search0turn3search1
+
+В заявку передаются:
 
 ```text
-МегаФон ВАТС
-    │ HTTPS POST / history
-    ▼
-Cloudflare Worker
-    │
-    ├── проверка secret path
-    ├── проверка crm_token
-    ├── проверка cmd=history
-    ├── проверка type=in
-    ├── проверка status=success
-    ├── проверка duration > 10
-    └── идемпотентная запись callid в D1
-             │
-             ▼
-          D1 calls
-             │
-             ▼
-       background processing
-             │
-             ▼
-       IntraService API
-             │
-             ▼
-        заявка «Звонки»
+ServiceId  = 619
+TypeId     = 1024
+PriorityId = 11
+StatusId   = 29
+CreatorId  = 1744
 ```
 
-## Почему нет VPS
+`ExecutorIds` **не задаётся**, поскольку в текущем чате конкретный ID исполнителя не подтверждён. Это исключает ошибочное назначение заявки случайному пользователю. API IntraService допускает `ExecutorIds` как отдельное поле, но его значение здесь намеренно не используется. citeturn4search0
 
-В production не требуется собственный Linux/Windows-сервер, Docker, Nginx или SSH. Worker исполняется в инфраструктуре Cloudflare, D1 используется как техническая БД. Это уменьшает количество компонентов, которые необходимо администрировать.
+## Надёжность
 
-## Что делает текущая версия
-
-- принимает только `POST`;
-- endpoint имеет точный секретный путь `/webhook/megafon/<secret>`;
-- проверяет `crm_token`;
-- принимает только `cmd=history`;
-- принимает только входящие `type=in`;
-- принимает только успешные `status=success`;
-- создаёт заявку только при `duration > 10` секунд;
-- использует `uid` как уникальный `callid`;
-- сохраняет событие в D1 до обращения к IntraService;
-- защищает от повторной обработки через `INSERT OR IGNORE` + атомарный claim;
-- повторяет временно неуспешные операции через Cron Trigger;
-- ограничивает число попыток;
-- не пишет секреты в логи;
-- принимает только HTTPS-ссылку на запись разговора;
-- имеет `/health` для технической проверки Worker.
-
-## Важное ограничение
-
-Автоматическая синхронизация сотрудников MegaFon → IntraService пока намеренно не включена. Формат MegaFon `GET /crmapi/v1/users` подтверждён, включая `login`, `name`, `email`, но перед включением синхронизации необходимо подтвердить способ авторизации API именно для вашей ВАТС. До этого сопоставление сотрудников хранится в D1 и заполняется после получения реальных данных.
+Событие сначала фиксируется в D1, после чего выполняется создание заявки. Для повторных попыток используются состояния `RETRY` и `ERROR`. Дополнительно Cron восстанавливает зависшие записи `PROCESSING`, если фоновая обработка была прервана.
 
 ## Структура
 
@@ -63,44 +60,38 @@ Cloudflare Worker
 .
 ├── src/
 │   └── worker.js
+├── tests/
+│   └── worker.test.js
 ├── schema.sql
 ├── wrangler.jsonc
 ├── package.json
 ├── .gitignore
-├── README.md
 └── docs/
     ├── ARCHITECTURE.md
     ├── SECURITY.md
     └── SETUP.md
 ```
 
-## Перед первым deploy
+## Локальная проверка
 
-1. Создать D1:
-   `npx wrangler d1 create megafon-intraservice`
-2. Полученный `database_id` внести в `wrangler.jsonc`.
-3. Применить `schema.sql` к remote D1.
-4. Создать все Cloudflare Secrets из `docs/SETUP.md`.
-5. Получить реальные `ServiceId`, `TypeId`, `PriorityId`, `StatusId` и `ExecutorId` из IntraService.
-6. Получить реальный пример webhook от вашей ВАТС и проверить поля.
-7. Только после этого публиковать webhook в MegaFon.
-
-## Тестовый endpoint
-
-После deploy:
-
-`GET /health`
-
-должен вернуть:
-
-```json
-{"status":"ok","service":"megafon-intraservice"}
+```bash
+npm install
+npm test
 ```
 
-Webhook:
+## Production
 
-`POST /webhook/megafon/<WEBHOOK_SECRET_PATH>`
+Перед deploy необходимо задать только секреты:
 
-## Источники и проверка
+```bash
+npx wrangler secret put MEGAFON_CRM_TOKEN
+npx wrangler secret put WEBHOOK_SECRET_PATH
+npx wrangler secret put INTRASERVICE_LOGIN
+npx wrangler secret put INTRASERVICE_PASSWORD
+```
 
-Архитектура использует штатные механизмы Cloudflare Workers, D1, Secrets и Cron Triggers. Формат MegaFon history и сотрудников должен быть дополнительно проверен на реальной ВАТС перед production-включением. IntraService-параметры заявки должны быть подтверждены по вашей версии API.
+ID D1 остаётся отдельным инфраструктурным параметром и должен быть указан в `wrangler.jsonc`. Секреты не хранить в Git. Cloudflare рекомендует хранить чувствительные значения в Secrets, а обычные конфигурационные значения — в `vars`. citeturn10search0turn10search2turn10search3
+
+## Ограничение проверки
+
+Код и конфигурация проверены статически и регрессионными тестами в репозитории. Фактический production-запрос к вашему IntraService невозможно подтвердить без реальных учётных данных и без выполнения тестового звонка из вашей ВАТС. Поэтому утверждать, что заявка уже успешно создаётся в вашей системе, **я не могу подтвердить** до такого теста.
