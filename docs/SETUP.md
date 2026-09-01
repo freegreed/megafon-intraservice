@@ -1,91 +1,69 @@
 # Пошаговая установка
 
-## Этап 0. Ничего не деплоить
+## Этап 0. Подтверждённые параметры проекта
 
-Сначала получаем:
+В текущем проекте используются:
 
-- реальный URL IntraService;
-- параметры сервиса «Звонки»;
-- права интеграционной учётки;
-- реальный пример MegaFon `history` webhook;
-- подтверждение API-доступа MegaFon.
+- IntraService URL: `https://yfo-skfo.intraservice.ru`
+- ServiceId: `619`
+- TypeId: `1024`
+- PriorityId: `11` — низкий
+- StatusId: `29` — Выполнена
+- ExecutorId: `1744` — «Служебный аккаунт»
+- CreatorId: `1744` — «Служебный аккаунт»
+- D1 database: `megafon-intraservice`
+- D1 database ID: `ea1c5ad2-1a8e-404d-a2b2-bebdba22e8c5`
+
+Параметры MegaFon ВАТС, подтверждённые в текущем проекте:
+
+- API URL ВАТС: `https://vats123691.megapbx.ru/crmapi/v1`
+- webhook CRM token: хранится только в Cloudflare Secret
+- webhook path: хранится только в Cloudflare Secret
+
+Секретные значения не отправлять в чат и не коммитить в Git.
 
 ## Этап 1. Cloudflare
 
-На компьютере достаточно Node.js LTS и VS Code. Production-сервер не нужен.
-
-Установить зависимости:
-
-```bash
-npm install
-```
-
-Авторизовать Wrangler:
-
-```bash
-npx wrangler login
-```
-
-Проверить:
-
-```bash
-npx wrangler whoami
-```
+Production-сервер и программы на пользовательском компьютере для работы интеграции не нужны. Worker собирается Cloudflare Workers Builds из подключённого GitHub-репозитория.
 
 ## Этап 2. D1
 
-Создать БД:
+База уже создана и привязана к Worker через binding `DB`.
 
-```bash
-npx wrangler d1 create megafon-intraservice
-```
+Схема должна содержать таблицы `calls`, `errors`, `users_mapping` и `sync_runs`.
 
-Команда вернёт `database_id`. Его нужно вставить в `wrangler.jsonc` вместо:
-
-```text
-REPLACE_WITH_D1_DATABASE_ID
-```
-
-Применить схему:
-
-```bash
-npx wrangler d1 execute megafon-intraservice --remote --file=schema.sql
-```
-
-Проверить таблицы:
-
-```bash
-npx wrangler d1 execute megafon-intraservice --remote --command="SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;"
-```
+`users_mapping` пока не используется в создании заявок: для текущей версии не требуется сопоставление оператора MegaFon с пользователем IntraService.
 
 ## Этап 3. Secrets
 
-Задать секреты:
+Worker требует только пять секретов:
 
-```bash
-npx wrangler secret put MEGAFON_CRM_TOKEN
-npx wrangler secret put WEBHOOK_SECRET_PATH
-npx wrangler secret put INTRASERVICE_URL
-npx wrangler secret put INTRASERVICE_LOGIN
-npx wrangler secret put INTRASERVICE_PASSWORD
-npx wrangler secret put IS_SERVICE_ID
-npx wrangler secret put IS_TYPE_ID
-npx wrangler secret put IS_PRIORITY_ID
-npx wrangler secret put IS_STATUS_DONE_ID
-npx wrangler secret put IS_EXECUTOR_ID
+```text
+MEGAFON_CRM_TOKEN
+WEBHOOK_SECRET_PATH
+INTRASERVICE_URL
+INTRASERVICE_LOGIN
+INTRASERVICE_PASSWORD
 ```
 
-Значения секретов не отправлять в чат и не коммитить в Git.
+Старые секреты `IS_SERVICE_ID`, `IS_TYPE_ID`, `IS_PRIORITY_ID`, `IS_STATUS_DONE_ID`, `IS_EXECUTOR_ID`, если они уже были созданы, можно оставить. Worker их больше не использует и не требует при deploy.
 
-## Этап 4. Первый deploy
+Cloudflare проверяет наличие секретов, перечисленных в `secrets.required`, во время deploy. urlДокументация Cloudflare по Secretshttps://developers.cloudflare.com/workers/configuration/secrets/
 
-```bash
-npx wrangler deploy
+## Этап 4. Deploy
+
+После изменения GitHub-репозитория Cloudflare Workers Builds должен автоматически запустить новый build.
+
+Ожидаемый результат:
+
+```text
+Initializing   ✓
+Cloning       ✓
+Installing    ✓
+Deploying     ✓
 ```
 
-Получить URL Worker.
-
-Проверить:
+После успешного deploy проверить:
 
 ```text
 GET https://<worker>/health
@@ -99,73 +77,99 @@ GET https://<worker>/health
 
 ## Этап 5. MegaFon
 
-В CRM-интеграции ВАТС указать webhook URL:
+В CRM-интеграции ВАТС необходимо указать адрес CRM/webhook, который будет предоставлен после успешного deploy Worker:
 
 ```text
 https://<worker>/webhook/megafon/<WEBHOOK_SECRET_PATH>
 ```
 
-Тип события: `history`.
+Важно: `https://vats123691.megapbx.ru/crmapi/v1` — это API самой ВАТС. Это не адрес webhook Worker.
 
-Не включать production-события до тестового звонка и проверки payload.
+## Этап 6. Обработка history
 
-## Этап 6. Тестовый звонок
+Worker принимает два формата тела webhook:
 
-Сделать входящий звонок с разговором более 10 секунд.
+- `application/json`;
+- `application/x-www-form-urlencoded`.
 
-Проверить Worker logs:
+Из события используются:
 
-```bash
-npx wrangler tail
+```text
+cmd
+crm_token
+uid / callid
+ type
+status
+phone / client
+user
+start
+duration
+record
 ```
 
-Проверить D1:
+Бизнес-условие создания заявки:
 
-```bash
-npx wrangler d1 execute megafon-intraservice --remote --command="SELECT callid, phone, megafon_user, duration, status, intraservice_task_id FROM calls ORDER BY id DESC LIMIT 20;"
+```text
+cmd = history
+AND type = in
+AND status = success
+AND duration > 10
 ```
 
-## Этап 7. IntraService
+Оператор `user` сохраняется в D1, но отсутствие `user` больше не блокирует создание заявки.
 
-Перед первым реальным звонком определить через API вашей версии IntraService:
+Для номера используется `phone`; если он отсутствует, допускается `client`.
 
-- ServiceId сервиса «Звонки»;
-- TypeId типа заявки;
-- PriorityId;
-- StatusId «Выполнена»;
-- User.Id системной учётки «Интеграция МегаФон»;
-- User.Id операторов.
+## Этап 7. Создание заявки IntraService
 
-Сначала создать одну тестовую заявку через API и убедиться, что поля `CreatorId` и `ExecutorIds` принимаются вашей версией API.
+При прохождении фильтра создаётся заявка со следующими параметрами:
 
-## Этап 8. Сопоставление сотрудников
-
-После получения реального списка MegaFon users и списка IntraService users заполнить `users_mapping`.
-
-Пример:
-
-```sql
-INSERT INTO users_mapping
-(megafon_login, megafon_name, email, intraservice_user_id, intraservice_name, active, mapping_status)
-VALUES
-('ivan', 'Иванов Иван', 'ivanov@example.ru', 152, 'Иванов Иван', 1, 'MATCHED');
+```text
+ServiceId   = 619
+TypeId      = 1024
+PriorityId  = 11
+StatusId    = 29
+CreatorId   = 1744
+ExecutorIds = 1744
 ```
 
-Автоматическую синхронизацию включаем только после подтверждения API authentication.
+Заявитель/создатель и исполнитель — один служебный аккаунт IntraService ID 1744.
 
-## Этап 9. Финальные тесты
+В описание передаются:
 
-Проверить:
+- номер клиента;
+- длительность разговора;
+- Call ID;
+- время звонка;
+- ссылка на запись, если `record` содержит HTTPS URL.
 
-- входящий 5 секунд → заявки нет;
-- входящий 10 секунд → заявки нет;
-- входящий 11 секунд → заявка есть;
-- входящий успешный → заявка есть;
-- пропущенный → заявки нет;
-- исходящий → заявки нет;
-- неизвестный оператор → заявка не создаётся от неправильного пользователя;
-- повтор webhook → второй заявки нет;
-- временная ошибка IntraService → retry;
-- 5 неудачных попыток → `ERROR`;
-- отсутствующая запись → заявка всё равно создаётся;
-- HTTPS запись → ссылка попадает в описание.
+## Этап 8. Дубликаты и ошибки
+
+`uid`/`callid` хранится в D1 с уникальным ограничением. Повторное событие с тем же идентификатором не создаёт вторую заявку.
+
+При ошибке обращения к IntraService:
+
+- событие сохраняется в D1;
+- выполняется retry;
+- интервал увеличивается до 60 минут;
+- после 5 неудачных попыток запись получает статус `ERROR`.
+
+## Этап 9. Финальный тест
+
+Проверить последовательно:
+
+1. `GET /health` → HTTP 200.
+2. Входящий звонок 5 секунд → заявки нет.
+3. Входящий звонок 10 секунд → заявки нет.
+4. Входящий звонок 11+ секунд → заявка создаётся.
+5. Исходящий звонок → заявки нет.
+6. Пропущенный звонок → заявки нет.
+7. Повтор того же `uid` → второй заявки нет.
+8. В заявке ServiceId = 619.
+9. Тип = 1024.
+10. Приоритет = 11.
+11. Статус = 29 «Выполнена».
+12. Исполнитель = 1744 «Служебный аккаунт».
+13. Запись разговора попадает в описание, если MegaFon передал HTTPS URL.
+
+Не включать массовую обработку production-событий до успешного одиночного тестового звонка.
