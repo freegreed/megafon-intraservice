@@ -1,314 +1,445 @@
 /**
- * ============================================================
- *  Worker: МегаФон ВАТС → IntraService
- *  Webhook-обработчик для интеграции телефонии и HelpDesk
- * ============================================================
+ * МегаФон ВАТС → Cloudflare Worker → D1 → IntraService
  *
- * Архитектура:
- *   МегаФон ВАТС
- *      ↓ HTTPS POST webhook
- *   Cloudflare Worker (этот файл)
- *      ↓
- *   Cloudflare D1 (защита от дублей, аудит, retry)
- *      ↓
- *   IntraService API (создание заявки)
+ * Production rules:
+ * - принимает только POST на точный секретный webhook path;
+ * - проверяет crm_token;
+ * - обрабатывает только cmd=history, type=in, status=success;
+ * - создаёт заявку только если duration > 10 секунд;
+ * - сохраняет callid до фоновой обработки;
+ * - использует D1 как идемпотентное хранилище и очередь retry;
+ * - никогда не пишет секреты в логи.
  *
- * Секреты (задаются через `npx wrangler secret put`):
- *   MEGAFON_CRM_TOKEN      — crm_token из МегаФона
- *   WEBHOOK_SECRET_PATH    — случайный сегмент в URL
- *   INTRASERVICE_URL       — базовый URL IntraService
- *   INTRASERVICE_LOGIN     — логин учётки «Интеграция МегаФон»
- *   INTRASERVICE_PASSWORD  — пароль учётки «Интеграция МегаФон»
- *   MEGAFON_API_URL        — URL API МегаФона (для синхронизации)
- *   MEGAFON_API_TOKEN      — токен API МегаФона
- *   IS_SERVICE_ID          — ID сервиса «Звонки»
- *   IS_TYPE_ID             — ID типа заявки
- *   IS_PRIORITY_ID         — ID приоритета
- *   IS_STATUS_DONE_ID      — ID статуса «Выполнена»
- *   IS_EXECUTOR_ID         — ID исполнителя (учётка интеграции)
+ * Важное ограничение текущей версии:
+ * синхронизация сотрудников через MegaFon REST API сознательно вынесена
+ * в отдельный адаптер. Формат ответа GET /crmapi/v1/users известен,
+ * но способ авторизации API должен быть подтверждён на конкретной ВАТС
+ * до включения автоматической синхронизации.
  */
 
-// ── Константы бизнес-логики ──────────────────────────────────
-const MIN_DURATION_SEC = 10;          // минимальная длительность разговора
-const MAX_ATTEMPTS = 5;                // максимум попыток retry
+const MIN_DURATION_SEC = 10;
+const MAX_ATTEMPTS = 5;
+const RETRY_MINUTES = 5;
+const MAX_BODY_BYTES = 64 * 1024;
 
-// ── Точка входа Worker ──────────────────────────────────────
 export default {
-  /**
-   * Обработка HTTP-запросов (webhook от МегаФона)
-   */
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // Разрешаем только POST
+    if (request.method === "GET" && url.pathname === "/health") {
+      return json({ status: "ok", service: "megafon-intraservice" });
+    }
+
     if (request.method !== "POST") {
       return json({ error: "Method Not Allowed" }, 405);
     }
 
-    // Проверяем секретный путь
-    const secretPath = env.WEBHOOK_SECRET_PATH;
-    if (secretPath && !url.pathname.includes(secretPath)) {
+    const expectedPath = `/webhook/megafon/${env.WEBHOOK_SECRET_PATH}`;
+    if (!env.WEBHOOK_SECRET_PATH || url.pathname !== expectedPath) {
       return json({ error: "Not Found" }, 404);
+    }
+
+    const contentLength = Number(request.headers.get("content-length") || 0);
+    if (contentLength > MAX_BODY_BYTES) {
+      return json({ error: "Payload Too Large" }, 413);
+    }
+
+    const contentType = request.headers.get("content-type") || "";
+    if (!contentType.toLowerCase().includes("application/json")) {
+      return json({ error: "Content-Type must be application/json" }, 415);
     }
 
     let payload;
     try {
-      payload = await request.json();
+      const raw = await request.text();
+      if (new TextEncoder().encode(raw).byteLength > MAX_BODY_BYTES) {
+        return json({ error: "Payload Too Large" }, 413);
+      }
+      payload = JSON.parse(raw);
     } catch {
       return json({ error: "Invalid JSON" }, 400);
     }
 
-    // Обрабатываем событие
-    const result = await handleMegafonEvent(payload, env);
-    return json(result.body, result.status);
+    if (payload?.crm_token !== env.MEGAFON_CRM_TOKEN) {
+      console.warn("Rejected MegaFon webhook: invalid token");
+      return json({ error: "Unauthorized" }, 401);
+    }
+
+    const call = parseHistoryPayload(payload);
+    if (!call.ok) {
+      await logError(env, call.callid || null, "PAYLOAD", call.reason);
+      return json({ result: "rejected", reason: call.reason }, 400);
+    }
+
+    // Persist first. This is the durability boundary before background work.
+    const inserted = await insertCallIfAbsent(env, call.data);
+
+    if (!inserted) {
+      console.info(`Duplicate webhook ignored: ${call.data.callid}`);
+      return json({ result: "duplicate", callid: call.data.callid }, 200);
+    }
+
+    // Do not make MegaFon wait for IntraService. D1 already contains the event.
+    ctx.waitUntil(processClaimedCall(env, call.data.callid));
+
+    return json({ result: "accepted", callid: call.data.callid }, 200);
   },
 
-  /**
-   * Cron Trigger — контрольная сверка и retry
-   */
-  async scheduled(event, env, ctx) {
+  async scheduled(_controller, env, ctx) {
     ctx.waitUntil(retryFailedCalls(env));
-    ctx.waitUntil(syncUsers(env));
+    // Employee synchronization is intentionally disabled until the exact
+    // MegaFon API authentication for the customer's VATS is verified.
   },
 };
 
-// ── Основная логика обработки события ───────────────────────
-async function handleMegafonEvent(payload, env) {
-  // 1. Проверка crm_token
-  if (payload.crm_token !== env.MEGAFON_CRM_TOKEN) {
-    await logError(env, null, "AUTH", "Invalid crm_token");
-    return { status: 401, body: { error: "Unauthorized" } };
+function parseHistoryPayload(payload) {
+  const cmd = String(payload?.cmd || "").toLowerCase();
+  const type = String(payload?.type || "").toLowerCase();
+  const status = String(payload?.status || "").toLowerCase();
+  const callid = String(payload?.uid || payload?.callid || "").trim();
+
+  if (cmd !== "history") {
+    return { ok: false, reason: "Unsupported command" };
   }
 
-  // 2. Извлекаем данные звонка
-  const data = payload.data || payload;
-  const callid = String(data.uid || data.callid || data.id || "");
   if (!callid) {
-    return { status: 400, body: { error: "Missing callid" } };
+    return { ok: false, reason: "Missing uid/callid" };
   }
 
-  const callType = data.type || payload.type || "";
-  const callStatus = data.status || payload.status || "";
-  const duration = parseInt(data.duration || "0", 10);
-  const recordUrl = data.record || data.recording || "";
-  const phone = data.from || data.phone || data.client || "";
-  const megafonUser = data.user || data.operator || "";
-  const callStart = data.start || data.calldate || data.created || "";
-
-  // 3. Бизнес-условия: только входящие, успешные, > 10 сек
-  if (callType !== "incoming") {
-    await saveCall(env, { callid, phone, megafonUser, duration, recordUrl, callStart, callType, callStatus, status: "SKIPPED" });
-    return { status: 200, body: { result: "skipped", reason: "not incoming" } };
+  // The MegaFon history contract uses type=in/out and status=success/missed.
+  if (type !== "in") {
+    return { ok: true, data: skippedCall(payload, callid, "not incoming") };
   }
 
-  if (callStatus !== "Success" && callStatus !== "success") {
-    await saveCall(env, { callid, phone, megafonUser, duration, recordUrl, callStart, callType, callStatus, status: "SKIPPED" });
-    return { status: 200, body: { result: "skipped", reason: "call not success" } };
+  if (status !== "success") {
+    return { ok: true, data: skippedCall(payload, callid, "not successful") };
   }
 
+  const duration = parseNonNegativeInt(payload?.duration);
   if (duration <= MIN_DURATION_SEC) {
-    await saveCall(env, { callid, phone, megafonUser, duration, recordUrl, callStart, callType, callStatus, status: "SKIPPED" });
-    return { status: 200, body: { result: "skipped", reason: "duration <= 10s" } };
+    return { ok: true, data: skippedCall(payload, callid, "duration <= 10s", duration) };
   }
 
-  // 4. Проверка на дубль
-  const existing = await env.DB.prepare("SELECT callid, status FROM calls WHERE callid = ?").bind(callid).first();
-  if (existing && (existing.status === "CREATED" || existing.status === "PROCESSING")) {
-    return { status: 200, body: { result: "duplicate", callid } };
+  const user = String(payload?.user || "").trim();
+  if (!user) {
+    return { ok: true, data: skippedCall(payload, callid, "missing operator user", duration) };
   }
 
-  // 5. Сохраняем событие в D1
-  await saveCall(env, { callid, phone, megafonUser, duration, recordUrl, callStart, callType, callStatus, status: "RECEIVED" });
+  return {
+    ok: true,
+    data: {
+      callid,
+      phone: normalizePhone(payload?.phone),
+      megafon_user: user,
+      duration,
+      record_url: safeUrl(payload?.record),
+      call_start: String(payload?.start || "").trim(),
+      call_type: type,
+      call_status: status,
+      status: "RECEIVED",
+    },
+  };
+}
 
-  // 6. Обрабатываем
+function skippedCall(payload, callid, reason, durationOverride) {
+  return {
+    callid,
+    phone: normalizePhone(payload?.phone),
+    megafon_user: String(payload?.user || "").trim(),
+    duration: durationOverride ?? parseNonNegativeInt(payload?.duration),
+    record_url: safeUrl(payload?.record),
+    call_start: String(payload?.start || "").trim(),
+    call_type: String(payload?.type || "").trim(),
+    call_status: String(payload?.status || "").trim(),
+    status: "SKIPPED",
+    error_type: "FILTER",
+    error_message: reason,
+  };
+}
+
+async function insertCallIfAbsent(env, call) {
+  const result = await env.DB.prepare(
+    `INSERT OR IGNORE INTO calls
+      (callid, phone, megafon_user, duration, record_url, call_start,
+       call_type, call_status, status, error_type, error_message, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`
+  )
+    .bind(
+      call.callid,
+      call.phone,
+      call.megafon_user,
+      call.duration,
+      call.record_url,
+      call.call_start,
+      call.call_type,
+      call.call_status,
+      call.status,
+      call.error_type || null,
+      call.error_message || null,
+    )
+    .run();
+
+  return Number(result.meta?.changes || 0) === 1;
+}
+
+async function processClaimedCall(env, callid) {
+  const claimed = await env.DB.prepare(
+    `UPDATE calls
+     SET status = 'PROCESSING', updated_at = datetime('now')
+     WHERE callid = ? AND status = 'RECEIVED'`
+  ).bind(callid).run();
+
+  if (Number(claimed.meta?.changes || 0) !== 1) {
+    return;
+  }
+
+  const row = await env.DB.prepare("SELECT * FROM calls WHERE callid = ?")
+    .bind(callid)
+    .first();
+
+  if (!row) {
+    await logError(env, callid, "DB", "Call disappeared after claim");
+    return;
+  }
+
   try {
-    await processCall(env, callid, phone, megafonUser, duration, recordUrl, callStart);
-    return { status: 200, body: { result: "created", callid } };
-  } catch (err) {
-    await markError(env, callid, "PROCESS", err.message);
-    return { status: 200, body: { result: "retry", callid, error: err.message } };
+    const mapping = await findActiveMapping(env, row.megafon_user);
+    if (!mapping || !mapping.intraservice_user_id) {
+      throw new Error(`No active IntraService mapping for MegaFon user: ${row.megafon_user}`);
+    }
+
+    const taskId = await createIntraServiceTask(env, {
+      phone: row.phone,
+      duration: row.duration,
+      recordUrl: row.record_url,
+      callid: row.callid,
+      callStart: row.call_start,
+      creatorId: mapping.intraservice_user_id,
+    });
+
+    if (!taskId) {
+      throw new Error("IntraService response did not contain task ID");
+    }
+
+    await env.DB.prepare(
+      `UPDATE calls
+       SET status = 'CREATED', intraservice_task_id = ?,
+           error_type = NULL, error_message = NULL,
+           next_retry_at = NULL, updated_at = datetime('now')
+       WHERE callid = ?`
+    ).bind(taskId, callid).run();
+
+    console.info(`Call ${callid} -> IntraService task ${taskId}`);
+  } catch (error) {
+    await scheduleRetry(env, callid, "PROCESS", safeErrorMessage(error));
   }
 }
 
-// ── Обработка звонка: сопоставление + создание заявки ───────
-async function processCall(env, callid, phone, megafonUser, duration, recordUrl, callStart) {
-  await updateCallStatus(env, callid, "PROCESSING");
-
-  // 1. Найти сотрудника в сопоставлении
-  const mapping = await env.DB.prepare(
-    "SELECT intraservice_user_id, intraservice_name FROM users_mapping WHERE megafon_login = ? AND active = 1"
-  ).bind(megafonUser).first();
-
-  if (!mapping) {
-    throw new Error(`Operator not found in mapping: ${megafonUser}`);
-  }
-
-  // 2. Создать заявку в IntraService
-  const taskId = await createIntraServiceTask(env, {
-    phone, duration, recordUrl, callid, callStart,
-    creatorId: mapping.intraservice_user_id,
-  });
-
-  // 3. Обновить запись
-  await env.DB.prepare(
-    "UPDATE calls SET status = 'CREATED', intraservice_task_id = ?, updated_at = datetime('now') WHERE callid = ?"
-  ).bind(taskId, callid).run();
-}
-
-// ── Создание заявки в IntraService ───────────────────────────
 async function createIntraServiceTask(env, { phone, duration, recordUrl, callid, callStart, creatorId }) {
-  const url = `${env.INTRASERVICE_URL}/api/task`;
+  const baseUrl = requireHttpsBaseUrl(env.INTRASERVICE_URL);
+  const url = `${baseUrl}/api/task`;
   const auth = btoa(`${env.INTRASERVICE_LOGIN}:${env.INTRASERVICE_PASSWORD}`);
 
   const description = [
-    `Номер клиента: ${phone}`,
+    `Номер клиента: ${phone || "не указан"}`,
     `Длительность: ${duration} сек.`,
     `Call ID: ${callid}`,
-    `Время: ${callStart}`,
-    "",
-    recordUrl ? `Запись разговора: <a href="${recordUrl}">Открыть запись</a>` : "Запись отсутствует",
-  ].join("\n");
+    `Время: ${callStart || "не указано"}`,
+    recordUrl
+      ? `Запись разговора: <a href="${escapeHtmlAttribute(recordUrl)}">Открыть запись</a>`
+      : "Запись разговора отсутствует",
+  ].join("<br>");
 
   const body = {
-    Name: `Звонок от ${phone}`,
+    Name: `Звонок от ${phone || "неизвестного номера"}`,
     Description: description,
-    ServiceId: parseInt(env.IS_SERVICE_ID, 10),
-    TypeId: parseInt(env.IS_TYPE_ID, 10),
-    PriorityId: parseInt(env.IS_PRIORITY_ID, 10),
-    StatusId: parseInt(env.IS_STATUS_DONE_ID, 10),
-    CreatorId: creatorId,
-    ExecutorIds: String(env.IS_EXECUTOR_ID),
+    ServiceId: requiredInt(env.IS_SERVICE_ID, "IS_SERVICE_ID"),
+    TypeId: requiredInt(env.IS_TYPE_ID, "IS_TYPE_ID"),
+    PriorityId: requiredInt(env.IS_PRIORITY_ID, "IS_PRIORITY_ID"),
+    StatusId: requiredInt(env.IS_STATUS_DONE_ID, "IS_STATUS_DONE_ID"),
+    CreatorId: requiredInt(creatorId, "CreatorId"),
+    ExecutorIds: String(requiredInt(env.IS_EXECUTOR_ID, "IS_EXECUTOR_ID")),
   };
 
-  const res = await fetch(url, {
+  const response = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "Authorization": `Basic ${auth}`,
+      Accept: "application/json",
+      Authorization: `Basic ${auth}`,
     },
     body: JSON.stringify(body),
   });
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`IntraService HTTP ${res.status}: ${text}`);
+  const responseText = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`IntraService HTTP ${response.status}`);
   }
 
-  const data = await res.json();
-  // IntraService возвращает Id созданной заявки
-  return data.Id || data.id || data.TaskId || data.task_id;
+  let data;
+  try {
+    data = responseText ? JSON.parse(responseText) : {};
+  } catch {
+    throw new Error("IntraService returned non-JSON response");
+  }
+
+  return data.Id ?? data.id ?? data.TaskId ?? data.task_id ?? data.task?.Id ?? null;
 }
 
-// ── Синхронизация сотрудников МегаФон ↔ IntraService ────────
-async function syncUsers(env) {
-  // 1. Получаем сотрудников из МегаФона
-  const megafonRes = await fetch(`${env.MEGAFON_API_URL}/crmapi/v1/users`, {
-    headers: { "Authorization": `Bearer ${env.MEGAFON_API_TOKEN}` },
-  });
-  if (!megafonRes.ok) {
-    await logError(env, null, "SYNC_MEGAFON", `HTTP ${megafonRes.status}`);
-    return;
-  }
-  const megafonUsers = await megafonRes.json();
-  const mfList = megafonUsers.data || megafonUsers.result || megafonUsers;
-
-  // 2. Получаем пользователей IntraService
-  const isAuth = btoa(`${env.INTRASERVICE_LOGIN}:${env.INTRASERVICE_PASSWORD}`);
-  const isRes = await fetch(`${env.INTRASERVICE_URL}/api/user`, {
-    headers: { "Authorization": `Basic ${isAuth}` },
-  });
-  if (!isRes.ok) {
-    await logError(env, null, "SYNC_INTRASERVICE", `HTTP ${isRes.status}`);
-    return;
-  }
-  const isUsers = await isRes.json();
-  const isList = isUsers.data || isUsers.result || isUsers;
-
-  // 3. Строим индекс email → IntraService UserId
-  const emailToIS = new Map();
-  for (const u of isList) {
-    if (u.Email || u.email) {
-      emailToIS.set((u.Email || u.email).toLowerCase(), { id: u.Id || u.id, name: u.Name || u.name });
-    }
-  }
-
-  // 4. Сопоставляем и обновляем D1
-  for (const mf of mfList) {
-    const login = mf.login || mf.Login;
-    const name = mf.name || mf.Name || "";
-    const email = (mf.email || mf.Email || "").toLowerCase();
-    if (!login) continue;
-
-    const match = emailToIS.get(email);
-    await env.DB.prepare(
-      `INSERT INTO users_mapping (megafon_login, megafon_name, email, intraservice_user_id, intraservice_name, active, updated_at)
-       VALUES (?, ?, ?, ?, ?, 1, datetime('now'))
-       ON CONFLICT(megafon_login) DO UPDATE SET
-         megafon_name = excluded.megafon_name,
-         email = excluded.email,
-         intraservice_user_id = excluded.intraservice_user_id,
-         intraservice_name = excluded.intraservice_name,
-         updated_at = datetime('now')`
-    ).bind(login, name, email, match ? match.id : null, match ? match.name : null).run();
-  }
+async function findActiveMapping(env, megafonLogin) {
+  return env.DB.prepare(
+    `SELECT intraservice_user_id, intraservice_name
+     FROM users_mapping
+     WHERE megafon_login = ? AND active = 1 AND mapping_status = 'MATCHED'`
+  ).bind(megafonLogin).first();
 }
 
-// ── Retry: повторная обработка звонков в статусе ERROR/RETRY ─
 async function retryFailedCalls(env) {
   const rows = await env.DB.prepare(
-    "SELECT * FROM calls WHERE status IN ('ERROR','RETRY') AND attempt < ? ORDER BY created_at ASC LIMIT 50"
+    `SELECT callid
+     FROM calls
+     WHERE status = 'RETRY'
+       AND attempt < ?
+       AND (next_retry_at IS NULL OR next_retry_at <= datetime('now'))
+     ORDER BY created_at ASC
+     LIMIT 50`
   ).bind(MAX_ATTEMPTS).all();
 
   for (const row of rows.results || []) {
-    try {
-      await processCall(env, row.callid, row.phone, row.megafon_user, row.duration, row.record_url, row.call_start);
-    } catch (err) {
-      await markError(env, row.callid, "RETRY", err.message);
-    }
+    await processRetry(env, row.callid);
   }
 }
 
-// ── Вспомогательные функции D1 ───────────────────────────────
-async function saveCall(env, c) {
-  await env.DB.prepare(
-    `INSERT INTO calls (callid, phone, megafon_user, duration, record_url, call_start, call_type, call_status, status, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-     ON CONFLICT(callid) DO UPDATE SET
-       phone = excluded.phone,
-       megafon_user = excluded.megafon_user,
-       duration = excluded.duration,
-       record_url = excluded.record_url,
-       call_start = excluded.call_start,
-       call_type = excluded.call_type,
-       call_status = excluded.call_status,
-       status = excluded.status,
-       updated_at = datetime('now')`
-  ).bind(c.callid, c.phone, c.megafonUser, c.duration, c.recordUrl, c.callStart, c.callType, c.callStatus, c.status).run();
+async function processRetry(env, callid) {
+  const claimed = await env.DB.prepare(
+    `UPDATE calls
+     SET status = 'PROCESSING', updated_at = datetime('now')
+     WHERE callid = ? AND status = 'RETRY'`
+  ).bind(callid).run();
+
+  if (Number(claimed.meta?.changes || 0) !== 1) {
+    return;
+  }
+
+  const row = await env.DB.prepare("SELECT * FROM calls WHERE callid = ?")
+    .bind(callid)
+    .first();
+
+  if (!row) return;
+
+  try {
+    const mapping = await findActiveMapping(env, row.megafon_user);
+    if (!mapping || !mapping.intraservice_user_id) {
+      throw new Error(`No active IntraService mapping for MegaFon user: ${row.megafon_user}`);
+    }
+
+    const taskId = await createIntraServiceTask(env, {
+      phone: row.phone,
+      duration: row.duration,
+      recordUrl: row.record_url,
+      callid: row.callid,
+      callStart: row.call_start,
+      creatorId: mapping.intraservice_user_id,
+    });
+
+    if (!taskId) throw new Error("IntraService task ID missing");
+
+    await env.DB.prepare(
+      `UPDATE calls SET status='CREATED', intraservice_task_id=?,
+       error_type=NULL, error_message=NULL, next_retry_at=NULL,
+       updated_at=datetime('now') WHERE callid=?`
+    ).bind(taskId, callid).run();
+  } catch (error) {
+    await scheduleRetry(env, callid, "RETRY", safeErrorMessage(error));
+  }
 }
 
-async function updateCallStatus(env, callid, status) {
+async function scheduleRetry(env, callid, errorType, message) {
+  const row = await env.DB.prepare("SELECT attempt FROM calls WHERE callid = ?")
+    .bind(callid)
+    .first();
+
+  const nextAttempt = Number(row?.attempt || 0) + 1;
+  const terminal = nextAttempt >= MAX_ATTEMPTS;
+  const status = terminal ? "ERROR" : "RETRY";
+  const delayMinutes = Math.min(RETRY_MINUTES * Math.pow(2, Math.max(0, nextAttempt - 1)), 60);
+
   await env.DB.prepare(
-    "UPDATE calls SET status = ?, updated_at = datetime('now') WHERE callid = ?"
-  ).bind(status, callid).run();
+    `UPDATE calls
+     SET status = ?, error_type = ?, error_message = ?, attempt = ?,
+         next_retry_at = CASE WHEN ? = 'RETRY' THEN datetime('now', ? || ' minutes') ELSE NULL END,
+         updated_at = datetime('now')
+     WHERE callid = ?`
+  ).bind(status, errorType, message, nextAttempt, status, String(delayMinutes), callid).run();
+
+  await env.DB.prepare(
+    `INSERT INTO errors (callid, error_type, error_message, attempt)
+     VALUES (?, ?, ?, ?)`
+  ).bind(callid, errorType, message, nextAttempt).run();
+
+  console.error(`Call ${callid} processing failed; status=${status}; attempt=${nextAttempt}`);
 }
 
-async function markError(env, callid, errorType, errorMessage) {
+async function logError(env, callid, errorType, message) {
   await env.DB.prepare(
-    "UPDATE calls SET status = 'ERROR', error_type = ?, error_message = ?, attempt = attempt + 1, updated_at = datetime('now') WHERE callid = ?"
-  ).bind(errorType, errorMessage, callid).run();
-  await logError(env, callid, errorType, errorMessage);
+    `INSERT INTO errors (callid, error_type, error_message, attempt)
+     VALUES (?, ?, ?, 1)`
+  ).bind(callid, errorType, message).run();
 }
 
-async function logError(env, callid, errorType, errorMessage) {
-  await env.DB.prepare(
-    "INSERT INTO errors (callid, error_type, error_message, attempt) VALUES (?, ?, ?, 1)"
-  ).bind(callid, errorType, errorMessage).run();
+function normalizePhone(value) {
+  return String(value ?? "").trim();
 }
 
-// ── Утилиты ──────────────────────────────────────────────────
+function safeUrl(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return "";
+
+  try {
+    const url = new URL(text);
+    return url.protocol === "https:" ? url.toString() : "";
+  } catch {
+    return "";
+  }
+}
+
+function parseNonNegativeInt(value) {
+  const number = Number.parseInt(String(value ?? "0"), 10);
+  return Number.isFinite(number) && number >= 0 ? number : 0;
+}
+
+function requiredInt(value, name) {
+  const number = Number.parseInt(String(value), 10);
+  if (!Number.isInteger(number)) throw new Error(`${name} must be an integer`);
+  return number;
+}
+
+function requireHttpsBaseUrl(value) {
+  const url = new URL(String(value || ""));
+  if (url.protocol !== "https:") throw new Error("INTRASERVICE_URL must use HTTPS");
+  return url.toString().replace(/\/$/, "");
+}
+
+function escapeHtmlAttribute(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function safeErrorMessage(error) {
+  const text = error instanceof Error ? error.message : String(error);
+  return text.slice(0, 500);
+}
+
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+    },
   });
 }
