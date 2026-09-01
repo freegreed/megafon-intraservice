@@ -36,7 +36,7 @@ Worker принимает только успешные входящие зво�
 
 ## Создание заявки
 
-Worker отправляет `POST /api/task` в IntraService с Basic Authentication. API IntraService работает с Basic Authentication и для создания заявки принимает поля объекта Task. citeturn6search0turn3search1
+Worker отправляет `POST /api/task` в IntraService с Basic Authentication.
 
 В заявку передаются:
 
@@ -48,7 +48,7 @@ StatusId   = 29
 CreatorId  = 1744
 ```
 
-`ExecutorIds` **не задаётся**, поскольку в текущем чате конкретный ID исполнителя не подтверждён. Это исключает ошибочное назначение заявки случайному пользователю. API IntraService допускает `ExecutorIds` как отдельное поле, но его значение здесь намеренно не используется. citeturn4search0
+`ExecutorIds` **не задаётся**, поскольку в текущем чате конкретный ID исполнителя не подтверждён. Это исключает ошибочное назначение заявки случайному пользователю.
 
 ## Надёжность
 
@@ -90,7 +90,7 @@ npx wrangler secret put INTRASERVICE_LOGIN
 npx wrangler secret put INTRASERVICE_PASSWORD
 ```
 
-ID D1 остаётся отдельным инфраструктурным параметром и должен быть указан в `wrangler.jsonc`. Секреты не хранить в Git. Cloudflare рекомендует хранить чувствительные значения в Secrets, а обычные конфигурационные значения — в `vars`. citeturn10search0turn10search2turn10search3
+ID D1 остаётся отдельным инфраструктурным параметром и должен быть указан в `wrangler.jsonc`. Секреты не хранить в Git.
 
 ## Ограничение проверки
 
