@@ -285,14 +285,21 @@ async function createIntraServiceTask(env, { phone, duration, recordUrl, callid,
   const responseText = await response.text();
 
   if (!response.ok) {
-    throw new Error(`IntraService HTTP ${response.status}`);
+    // Do not log Authorization or any other secret. The response body is limited
+    // because it is stored in the D1 error table and Cloudflare logs.
+    const details = responseText.replace(/\s+/g, " ").trim().slice(0, 450);
+    throw new Error(
+      `IntraService HTTP ${response.status}${details ? `: ${details}` : ""}`,
+    );
   }
 
   let data;
   try {
     data = responseText ? JSON.parse(responseText) : {};
   } catch {
-    throw new Error("IntraService returned non-JSON response");
+    throw new Error(
+      `IntraService returned non-JSON response${responseText ? `: ${responseText.replace(/\s+/g, " ").trim().slice(0, 400)}` : ""}`,
+    );
   }
 
   return data.Id ?? data.id ?? data.TaskId ?? data.task_id ?? data.task?.Id ?? null;
