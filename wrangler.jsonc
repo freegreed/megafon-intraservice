@@ -29,7 +29,7 @@
       "IS_TYPE_ID",
       "IS_PRIORITY_ID",
       "IS_STATUS_DONE_ID",
-      "IS_CREATOR_ID"
+      "IS_EXECUTOR_ID"
     ]
   }
 }
