@@ -1,0 +1,22 @@
+{
+  "name": "megafon-intraservice",
+  "version": "2.0.0",
+  "private": true,
+  "description": "МегаФон ВАТС → Cloudflare Worker → D1 → IntraService",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:create": "wrangler d1 create megafon-intraservice",
+    "db:init": "wrangler d1 execute megafon-intraservice --remote --file=schema.sql",
+    "db:query": "wrangler d1 execute megafon-intraservice --remote --command",
+    "tail": "wrangler tail",
+    "types": "wrangler types"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "wrangler": "^4.36.0"
+  }
+}
