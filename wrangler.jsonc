@@ -8,6 +8,14 @@
     "enabled": true,
     "head_sampling_rate": 1
   },
+  "vars": {
+    "INTRASERVICE_URL": "https://yfo-skfo.intraservice.ru",
+    "IS_SERVICE_ID": "619",
+    "IS_TYPE_ID": "1024",
+    "IS_PRIORITY_ID": "11",
+    "IS_STATUS_DONE_ID": "29",
+    "IS_CREATOR_ID": "1744"
+  },
   "d1_databases": [
     {
       "binding": "DB",
@@ -22,14 +30,8 @@
     "required": [
       "MEGAFON_CRM_TOKEN",
       "WEBHOOK_SECRET_PATH",
-      "INTRASERVICE_URL",
       "INTRASERVICE_LOGIN",
-      "INTRASERVICE_PASSWORD",
-      "IS_SERVICE_ID",
-      "IS_TYPE_ID",
-      "IS_PRIORITY_ID",
-      "IS_STATUS_DONE_ID",
-      "IS_EXECUTOR_ID"
+      "INTRASERVICE_PASSWORD"
     ]
   }
 }
