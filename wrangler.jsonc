@@ -1,0 +1,35 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "megafon-intraservice",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-09-01",
+  "workers_dev": true,
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "megafon-intraservice",
+      "database_id": "REPLACE_WITH_D1_DATABASE_ID"
+    }
+  ],
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
+  "secrets": {
+    "required": [
+      "MEGAFON_CRM_TOKEN",
+      "WEBHOOK_SECRET_PATH",
+      "INTRASERVICE_URL",
+      "INTRASERVICE_LOGIN",
+      "INTRASERVICE_PASSWORD",
+      "IS_SERVICE_ID",
+      "IS_TYPE_ID",
+      "IS_PRIORITY_ID",
+      "IS_STATUS_DONE_ID",
+      "IS_EXECUTOR_ID"
+    ]
+  }
+}
