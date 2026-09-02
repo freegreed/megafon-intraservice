@@ -10,6 +10,7 @@ const MAX_ATTEMPTS = 5;
 const RETRY_MINUTES = 5;
 const MAX_BODY_BYTES = 64 * 1024;
 const API_SYNC_DEBOUNCE_SEC = 30;
+const API_LOOKBACK_MINUTES = 30;
 
 const IS_SERVICE_ID = 619;
 const IS_TYPE_ID = 1024;
@@ -45,10 +46,15 @@ export default {
       return json({ error: "Unauthorized" }, 401);
     }
 
-    // MegaFon sends X-API-KEY on the callback request. It is used only in-memory
-    // for the authoritative history lookup and is never logged or stored in D1.
+    const callid = String(payload?.uid || payload?.callid || "").trim();
     const callbackApiKey = request.headers.get("x-api-key") || env.MEGAFON_API_KEY || "";
-    if (callbackApiKey) ctx.waitUntil(syncMegafonHistory(env, callbackApiKey, "callback"));
+
+    // A callback carries the VATS API key in X-API-KEY. For callbacks with a
+    // call id, query that exact call. This avoids the expensive period=today
+    // request that was producing HTTP 522 responses.
+    if (callbackApiKey) {
+      ctx.waitUntil(syncMegafonHistory(env, callbackApiKey, "callback", callid));
+    }
 
     const command = String(payload?.cmd || "").toLowerCase();
     if (command !== "history") {
@@ -76,7 +82,7 @@ export default {
 
   async scheduled(_controller, env, ctx) {
     if (env.MEGAFON_API_KEY) {
-      ctx.waitUntil(syncMegafonHistory(env, env.MEGAFON_API_KEY, "cron"));
+      ctx.waitUntil(syncMegafonHistory(env, env.MEGAFON_API_KEY, "cron", ""));
     } else {
       console.info("MegaFon API sync skipped: MEGAFON_API_KEY is not configured");
     }
@@ -141,15 +147,28 @@ function parseApiCall(item) {
   };
 }
 
-async function syncMegafonHistory(env, apiKey, source) {
+async function syncMegafonHistory(env, apiKey, source, uid = "") {
   try {
-    if (!(await acquireSyncSlot(env, source))) return;
-    const params = new URLSearchParams({ period: "today", type: "in", limit: "100", first_answered: "true" });
-    const response = await fetch(`${MEGAFON_API_BASE}/history/json?${params}`, {
+    const operation = uid ? "megafon_history_uid" : "megafon_history_window";
+    if (!(await acquireSyncSlot(env, source, operation, uid))) return;
+
+    const params = uid
+      ? new URLSearchParams({ uid })
+      : buildHistoryWindowParams(API_LOOKBACK_MINUTES);
+
+    const requestUrl = `${MEGAFON_API_BASE}/history/json?${params.toString()}`;
+    const startedAt = Date.now();
+    const response = await fetch(requestUrl, {
+      method: "GET",
       headers: { Accept: "application/json", "X-API-KEY": apiKey },
     });
     const text = await response.text();
-    if (!response.ok) throw new Error(`MegaFon history API HTTP ${response.status}`);
+    const elapsedMs = Date.now() - startedAt;
+
+    if (!response.ok) {
+      const details = text.replace(/\s+/g, " ").trim().slice(0, 450);
+      throw new Error(`MegaFon history API HTTP ${response.status}${details ? `: ${details}` : ""}`);
+    }
 
     let data;
     try { data = JSON.parse(text); } catch { throw new Error("MegaFon history API returned invalid JSON"); }
@@ -168,24 +187,45 @@ async function syncMegafonHistory(env, apiKey, source) {
     }
 
     await env.DB.prepare(`INSERT INTO sync_runs(operation,status,details) VALUES(?,?,?)`)
-      .bind("megafon_history", "SUCCESS", JSON.stringify({ source, received: items.length, eligible, inserted })).run();
-    console.info(`MegaFon history sync ${source}: received=${items.length}, eligible=${eligible}, inserted=${inserted}`);
+      .bind(
+        "megafon_history",
+        "SUCCESS",
+        JSON.stringify({ source, mode: uid ? "uid" : "window", uid: uid || undefined, received: items.length, eligible, inserted, elapsed_ms: elapsedMs }),
+      ).run();
+    console.info(`MegaFon history sync ${source}: mode=${uid ? "uid" : "window"}, received=${items.length}, eligible=${eligible}, inserted=${inserted}, elapsed_ms=${elapsedMs}`);
   } catch (error) {
-    await logError(env, null, "MEGAFON_API", safeErrorMessage(error));
-    console.warn(`MegaFon history sync failed: ${safeErrorMessage(error)}`);
+    await logError(env, uid || null, "MEGAFON_API", safeErrorMessage(error));
+    console.warn(`MegaFon history sync failed: mode=${uid ? "uid" : "window"}; ${safeErrorMessage(error)}`);
   }
 }
 
-async function acquireSyncSlot(env, source) {
+function buildHistoryWindowParams(lookbackMinutes) {
+  const now = new Date();
+  const start = new Date(now.getTime() - lookbackMinutes * 60 * 1000);
+  return new URLSearchParams({
+    start: formatMegaFonDate(start),
+    end: formatMegaFonDate(now),
+    type: "in",
+    limit: "100",
+  });
+}
+
+function formatMegaFonDate(date) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getUTCFullYear()}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}T${pad(date.getUTCHours())}${pad(date.getUTCMinutes())}${pad(date.getUTCSeconds())}Z`;
+}
+
+async function acquireSyncSlot(env, source, operation, uid = "") {
   const row = await env.DB.prepare(
-    `SELECT created_at FROM sync_runs WHERE operation='megafon_history_slot' ORDER BY id DESC LIMIT 1`
-  ).first();
+    `SELECT created_at, details FROM sync_runs WHERE operation=? ORDER BY id DESC LIMIT 1`
+  ).bind(operation).first();
   if (row?.created_at) {
-    const age = Date.now() - Date.parse(`${row.created_at.replace(" ", "T")}Z`);
-    if (Number.isFinite(age) && age < API_SYNC_DEBOUNCE_SEC * 1000) return false;
+    const age = Date.now() - Date.parse(`${String(row.created_at).replace(" ", "T")}Z`);
+    const sameUid = uid && String(row.details || "").includes(`"uid":"${uid}"`);
+    if (Number.isFinite(age) && age < API_SYNC_DEBOUNCE_SEC * 1000 && (!uid || sameUid)) return false;
   }
   await env.DB.prepare(`INSERT INTO sync_runs(operation,status,details) VALUES(?,?,?)`)
-    .bind("megafon_history_slot", "STARTED", JSON.stringify({ source })).run();
+    .bind(operation, "STARTED", JSON.stringify({ source, uid: uid || undefined })).run();
   return true;
 }
 
