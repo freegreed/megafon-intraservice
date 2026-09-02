@@ -9,6 +9,8 @@
  * - создаёт заявку только если duration > 10 секунд;
  * - использует uid/callid как идемпотентный идентификатор звонка;
  * - использует D1 как идемпотентное хранилище и очередь retry;
+ * - перед созданием и после POST проверяет IntraService по Call ID, чтобы retry
+ *   никогда не создавал вторую заявку после успешного POST;
  * - не требует сопоставления оператора MegaFon для создания заявки;
  * - заявитель и исполнитель IntraService — служебный аккаунт ID 1744;
  * - никогда не пишет секреты в логи.
@@ -38,10 +40,6 @@ export default {
       return json({ error: "Method Not Allowed" }, 405);
     }
 
-    // MegaFon can be configured with a base webhook URL or with an additional
-    // path suffix. Do not make delivery depend on WEBHOOK_SECRET_PATH matching
-    // the MegaFon configuration exactly. Authentication is performed below
-    // using crm_token, which remains mandatory.
     const webhookBasePath = "/webhook/megafon/";
     if (!url.pathname.startsWith(webhookBasePath)) {
       return json({ error: "Not Found" }, 404);
@@ -227,7 +225,7 @@ async function processClaimedCall(env, callid) {
     });
 
     if (!taskId) {
-      throw new Error("IntraService response did not contain task ID");
+      throw new Error("IntraService task ID missing after create/reconciliation");
     }
 
     await env.DB.prepare(
@@ -246,8 +244,17 @@ async function processClaimedCall(env, callid) {
 
 async function createIntraServiceTask(env, { phone, duration, recordUrl, callid, callStart }) {
   const baseUrl = requireHttpsBaseUrl(env.INTRASERVICE_URL);
-  const url = `${baseUrl}/api/task`;
   const auth = btoa(`${env.INTRASERVICE_LOGIN}:${env.INTRASERVICE_PASSWORD}`);
+
+  // Safety check: if a previous attempt already created the task but failed
+  // while reading its response, never create another task.
+  const existingBefore = await findExistingIntraServiceTask(env, auth, callid);
+  if (existingBefore) {
+    console.info(`IntraService task ${existingBefore} already exists for ${callid}`);
+    return existingBefore;
+  }
+
+  const url = `${baseUrl}/api/task`;
 
   const description = [
     `Номер клиента: ${phone || "не указан"}`,
@@ -282,6 +289,14 @@ async function createIntraServiceTask(env, { phone, duration, recordUrl, callid,
 
   const responseText = await response.text();
 
+  // Reconcile even after an HTTP error: some systems may persist the task
+  // before returning an error/timeout to the client.
+  const existingAfter = await findExistingIntraServiceTask(env, auth, callid);
+  if (existingAfter) {
+    console.info(`Reconciled IntraService task ${existingAfter} for ${callid}`);
+    return existingAfter;
+  }
+
   if (!response.ok) {
     const details = responseText.replace(/\s+/g, " ").trim().slice(0, 450);
     throw new Error(
@@ -289,16 +304,111 @@ async function createIntraServiceTask(env, { phone, duration, recordUrl, callid,
     );
   }
 
-  let data;
-  try {
-    data = responseText ? JSON.parse(responseText) : {};
-  } catch {
-    throw new Error(
-      `IntraService returned non-JSON response${responseText ? `: ${responseText.replace(/\s+/g, " ").trim().slice(0, 400)}` : ""}`,
-    );
+  const taskId = extractTaskId(responseText);
+  if (taskId) {
+    return taskId;
   }
 
-  return data.Id ?? data.id ?? data.TaskId ?? data.task_id ?? data.task?.Id ?? null;
+  throw new Error(
+    `IntraService task created but ID could not be extracted${responseText ? `: ${responseText.replace(/\s+/g, " ").trim().slice(0, 400)}` : ""}`,
+  );
+}
+
+async function findExistingIntraServiceTask(env, auth, callid) {
+  const baseUrl = requireHttpsBaseUrl(env.INTRASERVICE_URL);
+  const params = new URLSearchParams({
+    serviceid: String(IS_SERVICE_ID),
+    fields: "Id,Name,Description",
+    search: `Call ID: ${callid}`,
+    pagesize: "10",
+    page: "1",
+  });
+
+  const response = await fetch(`${baseUrl}/api/task?${params.toString()}`, {
+    method: "GET",
+    headers: {
+      Accept: "application/json",
+      Authorization: `Basic ${auth}`,
+    },
+  });
+
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`IntraService search HTTP ${response.status}`);
+  }
+
+  return extractMatchingTaskId(text, callid);
+}
+
+function extractMatchingTaskId(text, callid) {
+  if (!text) return null;
+
+  try {
+    const data = JSON.parse(text);
+    const tasks = Array.isArray(data?.Tasks)
+      ? data.Tasks
+      : Array.isArray(data)
+        ? data
+        : data?.Task
+          ? [data.Task]
+          : [];
+
+    for (const task of tasks) {
+      const id = task?.Id ?? task?.id;
+      const description = String(task?.Description ?? task?.description ?? "");
+      if (id != null && description.includes(`Call ID: ${callid}`)) {
+        return String(id);
+      }
+    }
+  } catch {
+    // Try XML below.
+  }
+
+  const taskBlocks = text.match(/<Task(?:\s[^>]*)?>[\s\S]*?<\/Task>/gi) || [];
+  for (const block of taskBlocks) {
+    const description = decodeXmlText(xmlTagValue(block, "Description"));
+    if (description.includes(`Call ID: ${callid}`)) {
+      const id = xmlTagValue(block, "Id");
+      if (id) return id;
+    }
+  }
+
+  return null;
+}
+
+function extractTaskId(text) {
+  if (!text) return null;
+
+  try {
+    const data = JSON.parse(text);
+    return String(
+      data?.Id ??
+      data?.id ??
+      data?.TaskId ??
+      data?.task_id ??
+      data?.Task?.Id ??
+      data?.task?.Id ??
+      "",
+    ) || null;
+  } catch {
+    const id = xmlTagValue(text, "Id") || xmlTagValue(text, "TaskId");
+    return id ? String(id) : null;
+  }
+}
+
+function xmlTagValue(text, tag) {
+  const match = text.match(new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)</${tag}>`, "i"));
+  return match ? match[1].trim() : "";
+}
+
+function decodeXmlText(value) {
+  return value
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
 }
 
 async function retryFailedCalls(env) {
@@ -343,13 +453,15 @@ async function processRetry(env, callid) {
       callStart: row.call_start,
     });
 
-    if (!taskId) throw new Error("IntraService task ID missing");
+    if (!taskId) throw new Error("IntraService task ID missing after retry/reconciliation");
 
     await env.DB.prepare(
       `UPDATE calls SET status='CREATED', intraservice_task_id=?,
        error_type=NULL, error_message=NULL, next_retry_at=NULL,
        updated_at=datetime('now') WHERE callid=?`
     ).bind(taskId, callid).run();
+
+    console.info(`Retry ${callid} -> IntraService task ${taskId}`);
   } catch (error) {
     await scheduleRetry(env, callid, "RETRY", safeErrorMessage(error));
   }
