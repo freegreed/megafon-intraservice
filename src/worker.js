@@ -62,9 +62,26 @@ export default {
       return json({ error: "Unauthorized" }, 401);
     }
 
+    const command = String(payload?.cmd || "").toLowerCase();
+
+    // MegaFon can send several CRM callback types. Only the history callback
+    // is used for ticket creation. Other valid callbacks must be acknowledged
+    // with HTTP 200 so MegaFon does not retry them as failed deliveries.
+    if (command !== "history") {
+      console.info("MegaFon callback ignored", safePayloadSummary(payload));
+      return json({ result: "ignored", reason: "Unsupported command" }, 200);
+    }
+
     const call = parseHistoryPayload(payload);
     if (!call.ok) {
-      await logError(env, call.callid || null, "PAYLOAD", call.reason);
+      const diagnostic = safePayloadSummary(payload);
+      await logError(
+        env,
+        call.callid || null,
+        "PAYLOAD",
+        `${call.reason}; ${diagnostic}`,
+      );
+      console.warn(`MegaFon history rejected: ${call.reason}; ${diagnostic}`);
       return json({ result: "rejected", reason: call.reason }, 400);
     }
 
@@ -152,6 +169,36 @@ function parseHistoryPayload(payload) {
       status: "RECEIVED",
     },
   };
+}
+
+function safePayloadSummary(payload) {
+  const keys = Object.keys(payload || {})
+    .filter((key) => key !== "crm_token")
+    .sort();
+
+  const cmd = String(payload?.cmd || "").trim();
+  const type = String(payload?.type || "").trim();
+  const status = String(payload?.status || "").trim();
+  const uid = String(payload?.uid || "").trim();
+  const callid = String(payload?.callid || "").trim();
+  const phone = String(payload?.phone || payload?.client || "").trim();
+  const user = String(payload?.user || "").trim();
+  const start = String(payload?.start || "").trim();
+  const duration = String(payload?.duration ?? "").trim();
+
+  return JSON.stringify({
+    keys,
+    cmd,
+    type,
+    status,
+    uid,
+    callid,
+    phone,
+    user,
+    start,
+    duration,
+    has_link: Boolean(payload?.link || payload?.record),
+  });
 }
 
 function skippedCall(payload, callid, reason, durationOverride) {
@@ -398,7 +445,7 @@ function extractTaskId(text) {
 }
 
 function xmlTagValue(text, tag) {
-  const match = text.match(new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)</${tag}>`, "i"));
+  const match = text.match(new RegExp(`<${tag}(?:\s[^>]*)?>([\s\S]*?)</${tag}>`, "i"));
   return match ? match[1].trim() : "";
 }
 
