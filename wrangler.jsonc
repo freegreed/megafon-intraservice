@@ -1,7 +1,7 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "megafon-intraservice",
-  "main": "src/worker.js",
+  "main": "src/worker_history_sync.js",
   "compatibility_date": "2026-09-01",
   "workers_dev": true,
   "observability": {
