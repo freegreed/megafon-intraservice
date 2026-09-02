@@ -2,7 +2,7 @@
  * МегаФон ВАТС → Cloudflare Worker → D1 → IntraService
  *
  * Production rules:
- * - принимает POST на точный секретный webhook path;
+ * - принимает POST на /webhook/megafon/ и на секретный webhook path;
  * - принимает JSON и application/x-www-form-urlencoded;
  * - проверяет crm_token;
  * - обрабатывает только cmd=history, type=in, status=success;
@@ -41,8 +41,13 @@ export default {
     const webhookSecretPath = String(env.WEBHOOK_SECRET_PATH || "")
       .trim()
       .replace(/^\/+|\/+$/g, "");
-    const expectedPath = `/webhook/megafon/${webhookSecretPath}`;
-    if (!webhookSecretPath || url.pathname !== expectedPath) {
+    const secretPath = `/webhook/megafon/${webhookSecretPath}`;
+    const publicPath = "/webhook/megafon/";
+
+    // MegaFon has already reached the Worker successfully. Accept both the
+    // configured secret path and the base webhook path; crm_token remains
+    // mandatory authentication for both routes.
+    if (url.pathname !== publicPath && (!webhookSecretPath || url.pathname !== secretPath)) {
       return json({ error: "Not Found" }, 404);
     }
 
@@ -146,7 +151,7 @@ function parseHistoryPayload(payload) {
       phone: normalizePhone(payload?.phone || payload?.client),
       megafon_user: user,
       duration,
-      record_url: safeUrl(payload?.record),
+      record_url: safeUrl(payload?.link || payload?.record),
       call_start: String(payload?.start || "").trim(),
       call_type: type,
       call_status: status,
@@ -161,7 +166,7 @@ function skippedCall(payload, callid, reason, durationOverride) {
     phone: normalizePhone(payload?.phone || payload?.client),
     megafon_user: String(payload?.user || "").trim(),
     duration: durationOverride ?? parseNonNegativeInt(payload?.duration),
-    record_url: safeUrl(payload?.record),
+    record_url: safeUrl(payload?.link || payload?.record),
     call_start: String(payload?.start || "").trim(),
     call_type: String(payload?.type || "").trim(),
     call_status: String(payload?.status || "").trim(),
@@ -248,8 +253,6 @@ async function createIntraServiceTask(env, { phone, duration, recordUrl, callid,
   const url = `${baseUrl}/api/task`;
   const auth = btoa(`${env.INTRASERVICE_LOGIN}:${env.INTRASERVICE_PASSWORD}`);
 
-  // IntraService Description behaves as plain text in the current deployment.
-  // Use real newlines instead of HTML <br>, which was displayed literally.
   const description = [
     `Номер клиента: ${phone || "не указан"}`,
     `Длительность: ${duration} сек.`,
@@ -395,22 +398,18 @@ function normalizePhone(value) {
 
   const digits = original.replace(/\D/g, "");
 
-  // Russian 10-digit national number: 9991234567 -> +79991234567.
   if (digits.length === 10 && digits.startsWith("9")) {
     return `+7${digits}`;
   }
 
-  // Russian number with leading 8: 89991234567 -> +79991234567.
   if (digits.length === 11 && digits.startsWith("8")) {
     return `+7${digits.slice(1)}`;
   }
 
-  // Already in Russian international form: 79991234567 -> +79991234567.
   if (digits.length === 11 && digits.startsWith("7")) {
     return `+${digits}`;
   }
 
-  // Do not corrupt non-Russian/incomplete values.
   return original;
 }
 
