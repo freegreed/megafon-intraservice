@@ -2,7 +2,7 @@
  * МегаФон ВАТС → Cloudflare Worker → D1 → IntraService
  *
  * Production rules:
- * - принимает POST на /webhook/megafon/ и на секретный webhook path;
+ * - принимает POST на /webhook/megafon/ и любой путь под /webhook/megafon/;
  * - принимает JSON и application/x-www-form-urlencoded;
  * - проверяет crm_token;
  * - обрабатывает только cmd=history, type=in, status=success;
@@ -38,16 +38,12 @@ export default {
       return json({ error: "Method Not Allowed" }, 405);
     }
 
-    const webhookSecretPath = String(env.WEBHOOK_SECRET_PATH || "")
-      .trim()
-      .replace(/^\/+|\/+$/g, "");
-    const secretPath = `/webhook/megafon/${webhookSecretPath}`;
-    const publicPath = "/webhook/megafon/";
-
-    // MegaFon has already reached the Worker successfully. Accept both the
-    // configured secret path and the base webhook path; crm_token remains
-    // mandatory authentication for both routes.
-    if (url.pathname !== publicPath && (!webhookSecretPath || url.pathname !== secretPath)) {
+    // MegaFon can be configured with a base webhook URL or with an additional
+    // path suffix. Do not make delivery depend on WEBHOOK_SECRET_PATH matching
+    // the MegaFon configuration exactly. Authentication is performed below
+    // using crm_token, which remains mandatory.
+    const webhookBasePath = "/webhook/megafon/";
+    if (!url.pathname.startsWith(webhookBasePath)) {
       return json({ error: "Not Found" }, 404);
     }
 
