@@ -10,7 +10,9 @@ const MAX_ATTEMPTS = 5;
 const RETRY_MINUTES = 5;
 const MAX_BODY_BYTES = 64 * 1024;
 const API_SYNC_DEBOUNCE_SEC = 30;
-const API_LOOKBACK_MINUTES = 30;
+const CALLBACK_LOOKBACK_MINUTES = 15;
+const CALLBACK_LOOKAHEAD_MINUTES = 5;
+const API_LOOKBACK_MINUTES = 15;
 
 const IS_SERVICE_ID = 619;
 const IS_TYPE_ID = 1024;
@@ -48,12 +50,18 @@ export default {
 
     const callid = String(payload?.uid || payload?.callid || "").trim();
     const callbackApiKey = request.headers.get("x-api-key") || env.MEGAFON_API_KEY || "";
+    const callbackPhone = normalizePhone(payload?.phone || payload?.client);
+    const callbackStart = String(payload?.start || "").trim();
 
-    // MegaFon callbacks contain the VATS API key in X-API-KEY. When a call ID
-    // is present, query that exact call. This avoids the expensive period=today
-    // request that was producing HTTP 522 responses.
+    // MegaFon documents uid as a history filter, but uid requests from this
+    // Worker are returning HTTP 522. Use the documented start/end + client
+    // filters instead, with a deliberately small window.
     if (callbackApiKey) {
-      ctx.waitUntil(syncMegafonHistory(env, callbackApiKey, "callback", callid));
+      ctx.waitUntil(syncMegafonHistory(env, callbackApiKey, "callback", {
+        phone: callbackPhone,
+        start: callbackStart,
+        callid,
+      }));
     }
 
     const command = String(payload?.cmd || "").toLowerCase();
@@ -82,7 +90,7 @@ export default {
 
   async scheduled(_controller, env, ctx) {
     if (env.MEGAFON_API_KEY) {
-      ctx.waitUntil(syncMegafonHistory(env, env.MEGAFON_API_KEY, "cron", ""));
+      ctx.waitUntil(syncMegafonHistory(env, env.MEGAFON_API_KEY, "cron", {}));
     } else {
       console.info("MegaFon API sync skipped: MEGAFON_API_KEY is not configured");
     }
@@ -147,14 +155,24 @@ function parseApiCall(item) {
   };
 }
 
-async function syncMegafonHistory(env, apiKey, source, uid = "") {
+async function syncMegafonHistory(env, apiKey, source, context = {}) {
   try {
-    const operation = uid ? "megafon_history_uid" : "megafon_history_window";
-    if (!(await acquireSyncSlot(env, source, operation, uid))) return;
+    const phone = normalizePhone(context.phone);
+    const startHint = parseDateValue(context.start);
+    const range = buildHistoryRange(startHint);
+    const operation = source === "callback" && context.callid
+      ? `megafon_history_${context.callid}`
+      : "megafon_history_window";
+    if (!(await acquireSyncSlot(env, operation, context.callid || ""))) return;
 
-    const params = uid
-      ? new URLSearchParams({ uid, first_answered: "true" })
-      : buildHistoryWindowParams(API_LOOKBACK_MINUTES);
+    const params = new URLSearchParams({
+      start: formatMegaFonDate(range.start),
+      end: formatMegaFonDate(range.end),
+      type: "in",
+      limit: "20",
+      first_answered: "true",
+    });
+    if (phone) params.set("client", phone.replace(/^\+/, ""));
 
     const requestUrl = `${MEGAFON_API_BASE}/history/json?${params.toString()}`;
     const startedAt = Date.now();
@@ -175,11 +193,13 @@ async function syncMegafonHistory(env, apiKey, source, uid = "") {
     const items = Array.isArray(data) ? data : Array.isArray(data?.items) ? data.items : [];
     let eligible = 0;
     let inserted = 0;
+    let matchedCallid = false;
 
     for (const item of items) {
       const call = parseApiCall(item);
       if (!call) continue;
       eligible++;
+      if (context.callid && call.callid === context.callid) matchedCallid = true;
       if (await insertCallIfAbsent(env, call)) {
         inserted++;
         await processClaimedCall(env, call.callid);
@@ -190,25 +210,46 @@ async function syncMegafonHistory(env, apiKey, source, uid = "") {
       .bind(
         "megafon_history",
         "SUCCESS",
-        JSON.stringify({ source, mode: uid ? "uid" : "window", uid: uid || undefined, received: items.length, eligible, inserted, elapsed_ms: elapsedMs }),
+        JSON.stringify({
+          source,
+          mode: phone ? "window+client" : "window",
+          callid: context.callid || undefined,
+          start: formatMegaFonDate(range.start),
+          end: formatMegaFonDate(range.end),
+          received: items.length,
+          eligible,
+          inserted,
+          matched_callid: matchedCallid,
+          elapsed_ms: elapsedMs,
+        }),
       ).run();
-    console.info(`MegaFon history sync ${source}: mode=${uid ? "uid" : "window"}, received=${items.length}, eligible=${eligible}, inserted=${inserted}, elapsed_ms=${elapsedMs}`);
+    console.info(`MegaFon history sync ${source}: mode=${phone ? "window+client" : "window"}, received=${items.length}, eligible=${eligible}, inserted=${inserted}, matched_callid=${matchedCallid}, elapsed_ms=${elapsedMs}`);
   } catch (error) {
-    await logError(env, uid || null, "MEGAFON_API", safeErrorMessage(error));
-    console.warn(`MegaFon history sync failed: mode=${uid ? "uid" : "window"}; ${safeErrorMessage(error)}`);
+    await logError(env, context.callid || null, "MEGAFON_API", safeErrorMessage(error));
+    console.warn(`MegaFon history sync failed: mode=window${context.callid ? `; callid=${context.callid}` : ""}; ${safeErrorMessage(error)}`);
   }
 }
 
-function buildHistoryWindowParams(lookbackMinutes) {
+function buildHistoryRange(startHint) {
+  if (startHint && Number.isFinite(startHint.getTime())) {
+    return {
+      start: new Date(startHint.getTime() - CALLBACK_LOOKBACK_MINUTES * 60 * 1000),
+      end: new Date(startHint.getTime() + CALLBACK_LOOKAHEAD_MINUTES * 60 * 1000),
+    };
+  }
   const now = new Date();
-  const start = new Date(now.getTime() - lookbackMinutes * 60 * 1000);
-  return new URLSearchParams({
-    start: formatMegaFonDate(start),
-    end: formatMegaFonDate(now),
-    type: "in",
-    limit: "100",
-    first_answered: "true",
-  });
+  return {
+    start: new Date(now.getTime() - API_LOOKBACK_MINUTES * 60 * 1000),
+    end: now,
+  };
+}
+
+function parseDateValue(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const normalized = raw.replace(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/, "$1-$2-$3T$4:$5:$6Z");
+  const date = new Date(normalized);
+  return Number.isFinite(date.getTime()) ? date : null;
 }
 
 function formatMegaFonDate(date) {
@@ -216,17 +257,16 @@ function formatMegaFonDate(date) {
   return `${date.getUTCFullYear()}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}T${pad(date.getUTCHours())}${pad(date.getUTCMinutes())}${pad(date.getUTCSeconds())}Z`;
 }
 
-async function acquireSyncSlot(env, source, operation, uid = "") {
+async function acquireSyncSlot(env, operation, callid = "") {
   const row = await env.DB.prepare(
     `SELECT created_at, details FROM sync_runs WHERE operation=? ORDER BY id DESC LIMIT 1`
   ).bind(operation).first();
   if (row?.created_at) {
     const age = Date.now() - Date.parse(`${String(row.created_at).replace(" ", "T")}Z`);
-    const sameUid = uid && String(row.details || "").includes(`"uid":"${uid}"`);
-    if (Number.isFinite(age) && age < API_SYNC_DEBOUNCE_SEC * 1000 && (!uid || sameUid)) return false;
+    if (Number.isFinite(age) && age < API_SYNC_DEBOUNCE_SEC * 1000) return false;
   }
   await env.DB.prepare(`INSERT INTO sync_runs(operation,status,details) VALUES(?,?,?)`)
-    .bind(operation, "STARTED", JSON.stringify({ source, uid: uid || undefined })).run();
+    .bind(operation, "STARTED", JSON.stringify({ callid: callid || undefined })).run();
   return true;
 }
 
