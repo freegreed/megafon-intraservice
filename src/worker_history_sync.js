@@ -49,8 +49,8 @@ export default {
     const callid = String(payload?.uid || payload?.callid || "").trim();
     const callbackApiKey = request.headers.get("x-api-key") || env.MEGAFON_API_KEY || "";
 
-    // A callback carries the VATS API key in X-API-KEY. For callbacks with a
-    // call id, query that exact call. This avoids the expensive period=today
+    // MegaFon callbacks contain the VATS API key in X-API-KEY. When a call ID
+    // is present, query that exact call. This avoids the expensive period=today
     // request that was producing HTTP 522 responses.
     if (callbackApiKey) {
       ctx.waitUntil(syncMegafonHistory(env, callbackApiKey, "callback", callid));
@@ -153,7 +153,7 @@ async function syncMegafonHistory(env, apiKey, source, uid = "") {
     if (!(await acquireSyncSlot(env, source, operation, uid))) return;
 
     const params = uid
-      ? new URLSearchParams({ uid })
+      ? new URLSearchParams({ uid, first_answered: "true" })
       : buildHistoryWindowParams(API_LOOKBACK_MINUTES);
 
     const requestUrl = `${MEGAFON_API_BASE}/history/json?${params.toString()}`;
@@ -207,6 +207,7 @@ function buildHistoryWindowParams(lookbackMinutes) {
     end: formatMegaFonDate(now),
     type: "in",
     limit: "100",
+    first_answered: "true",
   });
 }
 
