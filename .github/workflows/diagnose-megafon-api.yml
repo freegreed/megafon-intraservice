@@ -1,0 +1,19 @@
+name: Diagnose MegaFon API
+
+on:
+  push:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test MegaFon API endpoint
+        run: |
+          set -o pipefail
+          curl -sS -o /tmp/response.txt -D /tmp/headers.txt --connect-timeout 15 --max-time 30 \
+            -w '\nHTTP_STATUS=%{http_code}\nREMOTE_IP=%{remote_ip}\nTIME_CONNECT=%{time_connect}\nTIME_TOTAL=%{time_total}\n' \
+            'https://vats123691.megapbx.ru/crmapi/v1/history/json?type=in&limit=1' || true
+          echo '--- HEADERS ---'
+          cat /tmp/headers.txt || true
+          echo '--- BODY ---'
+          head -c 1000 /tmp/response.txt || true
