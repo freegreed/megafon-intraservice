@@ -74,7 +74,7 @@ Webhook принимает как `application/x-www-form-urlencoded`, так и
 
 `POST https://megafon-api.sm-svetofor.ru/webhook/megafon/`
 
-Для контроля пропущенных webhook Node.js периодически запрашивает MegaFon History API с `X-API-KEY`. Официальная документация MegaFon указывает REST API как штатный способ интеграции с собственной CRM. citeturn1search0turn1search9
+Для контроля пропущенных webhook Node.js периодически запрашивает MegaFon History API с `X-API-KEY`.
 
 ## Retry и идемпотентность
 
