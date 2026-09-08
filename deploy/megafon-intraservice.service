@@ -1,0 +1,22 @@
+[Unit]
+Description=MegaFon IntraService integration
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=megafon-app
+Group=megafon-app
+WorkingDirectory=/opt/megafon-intraservice
+EnvironmentFile=/etc/megafon-intraservice.env
+ExecStart=/usr/bin/node /opt/megafon-intraservice/src/server.js
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/megafon-intraservice
+
+[Install]
+WantedBy=multi-user.target
