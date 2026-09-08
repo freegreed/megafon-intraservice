@@ -1,24 +1,18 @@
 {
   "name": "megafon-intraservice",
-  "version": "2.1.0",
+  "version": "3.0.0",
   "private": true,
-  "description": "МегаФон ВАТС → Cloudflare Worker → D1 → IntraService",
+  "description": "МегаФон ВАТС → Node.js → PostgreSQL → IntraService",
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "npm run db:migrations:apply && wrangler deploy",
-    "db:create": "wrangler d1 create megafon-intraservice",
-    "db:init": "wrangler d1 execute megafon-intraservice --remote --file=schema.sql",
-    "db:migrations:apply": "wrangler d1 migrations apply DB --remote",
-    "db:migrations:list": "wrangler d1 migrations list DB --remote",
-    "db:query": "wrangler d1 execute megafon-intraservice --remote --command",
-    "tail": "wrangler tail",
-    "types": "wrangler types"
+    "start": "node src/server.js",
+    "check": "node --check src/server.js",
+    "migrate": "node scripts/migrate.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=24"
   },
-  "devDependencies": {
-    "wrangler": "^4.127.1"
+  "dependencies": {
+    "pg": "^8.16.3"
   }
 }
