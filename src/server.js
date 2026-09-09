@@ -360,12 +360,12 @@ async function createIntraServiceTask({ phone, duration, recordUrl, callid, call
     `Длительность: ${duration} сек.`,
     `Call ID: ${callid}`,
     `Время: ${callStart || "не указано"}`,
-    recordUrl ? `Запись разговора: ${recordUrl}` : "Запись разговора отсутствует",
   ].join("\n");
 
   const body = {
     Name: `Звонок от ${phone || "неизвестного номера"}`,
     Description: description,
+    Comment: recordUrl ? `Запись разговора: ${recordUrl}` : "Запись разговора отсутствует",
     ServiceId: IS_SERVICE_ID,
     TypeId: IS_TYPE_ID,
     PriorityId: IS_PRIORITY_ID,
@@ -406,222 +406,129 @@ async function scheduleRetry(callid, errorType, message) {
       updated_at=NOW() WHERE callid=$6`,
     [status, errorType, message, nextAttempt, String(delayMinutes), callid],
   );
-  await pool.query(
-    `INSERT INTO errors(callid,error_type,error_message,attempt) VALUES($1,$2,$3,$4)`,
-    [callid, errorType, message, nextAttempt],
-  );
-  log("error", "Call processing failed", { callid, status, attempt: nextAttempt, errorType, error: message });
+
+  log(terminal ? "error" : "warn", "Call processing failed", {
+    callid,
+    errorType,
+    error: message,
+    attempt: nextAttempt,
+    nextRetryAtMinutes: terminal ? null : delayMinutes,
+    terminal,
+  });
 }
 
-async function retryFailedCalls() {
+async function retryDueCalls() {
   const result = await pool.query(
     `SELECT callid FROM calls
-     WHERE status='RETRY' AND attempt < $1
-       AND (next_retry_at IS NULL OR next_retry_at <= NOW())
-     ORDER BY created_at ASC LIMIT 50`,
-    [MAX_ATTEMPTS],
+     WHERE status='RETRY' AND next_retry_at IS NOT NULL AND next_retry_at <= NOW()
+     ORDER BY next_retry_at ASC LIMIT 20`,
   );
-  for (const row of result.rows) await processCall(row.callid, "RETRY");
-}
-
-function parseApiRows(data) {
-  if (Array.isArray(data)) return data;
-  for (const key of ["history", "History", "calls", "Calls", "data", "Data", "result", "Result"]) {
-    if (Array.isArray(data?.[key])) return data[key];
+  for (const row of result.rows) {
+    await processCall(row.callid, "RETRY");
   }
-  return [];
 }
 
-function normalizeHistoryRow(row) {
-  const type = String(row?.type || row?.Type || "").toLowerCase();
-  const status = String(row?.status || row?.Status || "").toLowerCase();
-  const callid = String(row?.uid || row?.callid || row?.CallId || row?.id || "").trim();
-  const duration = parseNonNegativeInt(row?.duration ?? row?.Duration);
-  return {
-    callid,
-    type,
-    status,
-    duration,
-    phone: normalizePhone(row?.client || row?.phone || row?.Client || row?.Phone),
-    user: String(row?.user || row?.User || "").trim(),
-    start: String(row?.start || row?.Start || "").trim(),
-    record: safeUrl(row?.record || row?.link || row?.Record || row?.Link),
-  };
-}
+async function reconcileHistory() {
+  const base = String(process.env.MEGAFON_API_URL || "").replace(/\/$/, "");
+  const apiKey = process.env.MEGAFON_API_KEY;
+  const url = `${base}/crmapi/v1/history/json?type=in&limit=100`;
 
-async function reconcileMegaFonHistory() {
-  const minutes = Math.max(5, Number(process.env.MEGAFON_HISTORY_LOOKBACK_MINUTES || 15));
-  const end = new Date();
-  const start = new Date(end.getTime() - minutes * 60_000);
-  const params = new URLSearchParams({
-    start: formatApiDate(start),
-    end: formatApiDate(end),
-    type: "in",
-    limit: "1000",
-  });
-
-  const base = new URL(String(process.env.MEGAFON_API_URL));
-  const url = new URL("history/json", `${base.toString().replace(/\/$/, "")}/`);
-  url.search = params.toString();
-
-  const response = await fetch(url, {
-    headers: { Accept: "application/json", "X-API-KEY": process.env.MEGAFON_API_KEY },
-  });
-  const responseText = await response.text();
-  log("info", "MegaFon History API response", {
-    status: response.status,
-    ok: response.ok,
-    url: `${url.origin}${url.pathname}${url.search}`,
-    body: responseText.slice(0, 20_000),
-  });
-  if (!response.ok) throw new Error(`MegaFon History API HTTP ${response.status}: ${responseText.slice(0, 2000)}`);
-
-  let data;
   try {
-    data = JSON.parse(responseText);
-  } catch {
-    throw new Error("MegaFon History API returned invalid JSON");
-  }
-
-  let accepted = 0;
-  for (const raw of parseApiRows(data)) {
-    const row = normalizeHistoryRow(raw);
-    if (!row.callid || row.type !== "in" || row.status !== "success" || row.duration <= MIN_DURATION_SEC) continue;
-
-    const inserted = await insertCall({
-      callid: row.callid,
-      phone: row.phone,
-      megafon_user: row.user,
-      duration: row.duration,
-      record_url: row.record,
-      call_start: row.start,
-      call_type: row.type,
-      call_status: row.status,
-      status: "RECEIVED",
+    const response = await fetch(url, {
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
     });
-    if (inserted) {
-      accepted += 1;
-      void processCall(row.callid).catch((error) => log("error", "Async reconciliation processing failed", { callid: row.callid, error: safeErrorMessage(error) }));
+    const body = await response.text();
+    log("info", "MegaFon history response", {
+      status: response.status,
+      ok: response.ok,
+      body: body.slice(0, 20_000),
+    });
+    if (!response.ok) return;
+
+    let rows;
+    try {
+      rows = JSON.parse(body);
+    } catch (error) {
+      log("warn", "MegaFon history JSON parse failed", { error: safeErrorMessage(error) });
+      return;
     }
+
+    if (!Array.isArray(rows)) return;
+    for (const item of rows) {
+      const parsed = parseHistoryPayload({
+        cmd: "history",
+        type: item?.type,
+        status: item?.status,
+        uid: item?.uid,
+        phone: item?.phone,
+        client: item?.client,
+        user: item?.user,
+        duration: item?.duration,
+        record: item?.record,
+        start: item?.start,
+      });
+      if (!parsed.ok) continue;
+      const inserted = await insertCall(parsed.data);
+      if (inserted && parsed.data.status === "RECEIVED") {
+        await processCall(parsed.data.callid);
+      }
+    }
+  } catch (error) {
+    log("error", "MegaFon history reconciliation failed", { error: safeErrorMessage(error) });
   }
-
-  log("info", "MegaFon history reconciliation completed", { rows: parseApiRows(data).length, accepted });
 }
 
-function formatApiDate(date) {
-  const pad = (value) => String(value).padStart(2, "0");
-  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
+async function startup() {
+  await pool.query("SELECT 1");
+  log("info", "Database connected");
+  await reconcileHistory();
+  setInterval(() => reconcileHistory().catch((error) => log("error", "History interval failed", { error: safeErrorMessage(error) })), 60_000);
+  setInterval(() => retryDueCalls().catch((error) => log("error", "Retry interval failed", { error: safeErrorMessage(error) })), 30_000);
 }
 
-async function withReconcileLock(fn) {
-  const client = await pool.connect();
+const server = http.createServer(async (req, res) => {
   try {
-    const lock = await client.query("SELECT pg_try_advisory_lock(6191744) AS locked");
-    if (!lock.rows[0].locked) return false;
-    try {
-      await fn();
-      return true;
-    } finally {
-      await client.query("SELECT pg_advisory_unlock(6191744)");
-    }
-  } finally {
-    client.release();
-  }
-}
-
-async function reconcile() {
-  const locked = await withReconcileLock(async () => {
-    await retryFailedCalls();
-    await reconcileMegaFonHistory();
-  });
-  if (!locked) log("info", "Reconciliation skipped: another process holds the lock");
-}
-
-async function handle(req, res) {
-  const url = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
-
-  if (req.method === "GET" && url.pathname === "/health") {
-    try {
+    if (req.method === "GET" && req.url === "/health") {
       await pool.query("SELECT 1");
       return jsonResponse(res, 200, { status: "ok", service: "megafon-intraservice", database: "ok" });
-    } catch (error) {
-      return jsonResponse(res, 503, { status: "error", database: safeErrorMessage(error) });
     }
-  }
 
-  if (req.method !== "POST" || !url.pathname.startsWith("/webhook/megafon/")) {
-    return jsonResponse(res, 404, { error: "Not Found" });
-  }
+    if (req.method !== "POST" || req.url !== "/webhook/megafon/") {
+      return jsonResponse(res, 404, { error: "Not found" });
+    }
 
-  try {
     const payload = await readPayload(req);
-    if (payload?.crm_token !== process.env.MEGAFON_CRM_TOKEN) {
-      log("warn", "Rejected MegaFon webhook: invalid token");
+    log("info", "MegaFon webhook received", { summary: safePayloadSummary(payload) });
+
+    if (String(payload?.crm_token || "") !== process.env.MEGAFON_CRM_TOKEN) {
       return jsonResponse(res, 401, { error: "Unauthorized" });
     }
 
-    const command = String(payload?.cmd || "").toLowerCase();
-    if (command !== "history") {
-      log("info", "MegaFon callback ignored", safePayloadSummary(payload));
-      return jsonResponse(res, 200, { result: "ignored", reason: "Unsupported command" });
+    const parsed = parseHistoryPayload(payload);
+    if (!parsed.ok) return jsonResponse(res, 200, { result: "ignored", reason: parsed.reason });
+
+    const inserted = await insertCall(parsed.data);
+    if (inserted && parsed.data.status === "RECEIVED") {
+      await processCall(parsed.data.callid);
+      return jsonResponse(res, 200, { result: "accepted", callid: parsed.data.callid });
     }
 
-    const call = parseHistoryPayload(payload);
-    if (!call.ok) {
-      log("warn", "MegaFon history rejected", { reason: call.reason, payload: safePayloadSummary(payload) });
-      return jsonResponse(res, 400, { result: "rejected", reason: call.reason });
-    }
-
-    const inserted = await insertCall(call.data);
-    if (!inserted) {
-      log("info", "Duplicate webhook ignored", { callid: call.data.callid });
-      return jsonResponse(res, 200, { result: "duplicate", callid: call.data.callid });
-    }
-
-    void processCall(call.data.callid).catch((error) => {
-      log("error", "Async webhook processing failed", { callid: call.data.callid, error: safeErrorMessage(error) });
-    });
-
-    return jsonResponse(res, 200, { result: "accepted", callid: call.data.callid });
+    return jsonResponse(res, 200, { result: "ignored", reason: inserted ? parsed.data.error_message || parsed.data.status : "duplicate", callid: parsed.data.callid });
   } catch (error) {
     const message = safeErrorMessage(error);
-    const status = message === "Payload Too Large" ? 413 : 400;
-    log("error", "Webhook request failed", { error: message });
-    return jsonResponse(res, status, { error: message });
+    log("error", "Webhook handling failed", { error: message });
+    return jsonResponse(res, message === "Payload Too Large" ? 413 : 400, { error: message });
   }
-}
-
-const server = http.createServer((req, res) => {
-  handle(req, res).catch((error) => {
-    log("error", "Unhandled HTTP error", { error: safeErrorMessage(error) });
-    if (!res.headersSent) jsonResponse(res, 500, { error: "Internal Server Error" });
-    else res.destroy();
-  });
 });
 
 server.listen(PORT, HOST, () => {
   log("info", "Server started", { host: HOST, port: PORT });
 });
 
-const reconcileInterval = setInterval(() => {
-  reconcile().catch((error) => log("error", "Scheduled reconciliation failed", { error: safeErrorMessage(error) }));
-}, 5 * 60_000);
-reconcileInterval.unref();
-
-process.on("SIGTERM", async () => {
-  clearInterval(reconcileInterval);
-  server.close(async () => {
-    await pool.end();
-    process.exit(0);
-  });
+startup().catch((error) => {
+  log("error", "Startup failed", { error: safeErrorMessage(error) });
+  process.exit(1);
 });
-
-process.on("SIGINT", async () => {
-  clearInterval(reconcileInterval);
-  server.close(async () => {
-    await pool.end();
-    process.exit(0);
-  });
-});
-
-export { reconcile };
