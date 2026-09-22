@@ -385,31 +385,28 @@ async function findIntraServiceExecutorId(megafonUser, megafonUserName) {
     throw new Error("MegaFon employee login/name is missing; cannot determine IntraService executor");
   }
 
-  const fetchExecutors = async (search) => {
-    const params = new URLSearchParams({
-      serviceid: String(IS_SERVICE_ID),
-      fields: "Id,Login,Name",
-      pagesize: "2000",
-      page: "1",
-    });
-    if (search) params.set("search", search);
+  const params = new URLSearchParams({
+    serviceid: String(IS_SERVICE_ID),
+    fields: "Id,Login,Name",
+    pagesize: "2000",
+    page: "1",
+  });
 
-    const { response, responseText } = await intraserviceRequest(
-      "GET",
-      `/api/taskexecutor?${params.toString()}`,
+  const { response, responseText } = await intraserviceRequest(
+    "GET",
+    `/api/taskexecutor?${params.toString()}`,
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      `IntraService executor search HTTP ${response.status}: ${responseText.slice(0, 2000)}`,
     );
+  }
 
-    if (!response.ok) {
-      throw new Error(
-        `IntraService executor search HTTP ${response.status}: ${responseText.slice(0, 2000)}`,
-      );
-    }
-    return extractUsers(responseText);
-  };
+  const executors = extractUsers(responseText);
 
   if (login) {
-    const loginUsers = await fetchExecutors(login);
-    const exactLogin = loginUsers.filter(
+    const exactLogin = executors.filter(
       (user) => normalizeMatchText(user?.Login ?? user?.login) === normalizeMatchText(login),
     );
 
@@ -428,8 +425,7 @@ async function findIntraServiceExecutorId(megafonUser, megafonUserName) {
   }
 
   if (displayName) {
-    const nameUsers = await fetchExecutors(displayName);
-    const exactName = nameUsers.filter(
+    const exactName = executors.filter(
       (user) => normalizeMatchText(user?.Name ?? user?.name) === normalizeMatchText(displayName),
     );
 
