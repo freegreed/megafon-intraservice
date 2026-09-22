@@ -518,7 +518,7 @@ async function reconcileHistory() {
     const response = await fetch(url, {
       headers: {
         Accept: "application/json",
-        Authorization: `Bearer ${apiKey}`,
+        "X-API-KEY": apiKey,
       },
     });
     const body = await response.text();
