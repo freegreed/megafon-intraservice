@@ -510,9 +510,12 @@ async function retryDueCalls() {
 }
 
 async function reconcileHistory() {
-  const base = String(process.env.MEGAFON_API_URL || "").replace(/\/$/, "");
+  const configuredBase = String(process.env.MEGAFON_API_URL || "").replace(/\/$/, "");
+  const base = /\/crmapi\/v1$/i.test(configuredBase)
+    ? configuredBase
+    : `${configuredBase}/crmapi/v1`;
   const apiKey = process.env.MEGAFON_API_KEY;
-  const url = `${base}/crmapi/v1/history/json?type=in&limit=100`;
+  const url = `${base}/history/json?type=in&limit=100`;
 
   try {
     const response = await fetch(url, {
