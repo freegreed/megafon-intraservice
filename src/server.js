@@ -14,7 +14,6 @@ const IS_SERVICE_ID = 619;
 const IS_TYPE_ID = 1024;
 const IS_PRIORITY_ID = 11;
 const IS_STATUS_DONE_ID = 29;
-const IS_EXECUTOR_ID = 1744;
 const IS_CREATOR_ID = 1744;
 
 const requiredEnv = [
@@ -242,6 +241,7 @@ async function processCall(callid, fromStatus = "RECEIVED") {
       recordUrl: row.record_url,
       callid: row.callid,
       callStart: row.call_start,
+      megafonUser: row.megafon_user,
     });
 
     if (!taskId) throw new Error("IntraService task ID missing after create/reconciliation");
@@ -348,12 +348,93 @@ async function findExistingIntraServiceTask(callid) {
   return extractMatchingTaskId(responseText, callid);
 }
 
-async function createIntraServiceTask({ phone, duration, recordUrl, callid, callStart }) {
+function extractUsers(text) {
+  if (!text) return [];
+  try {
+    const data = JSON.parse(text);
+    if (Array.isArray(data?.Users)) return data.Users;
+    if (Array.isArray(data?.users)) return data.users;
+    if (data?.User) return [data.User];
+    if (data?.user) return [data.user];
+  } catch {
+    // XML fallback below.
+  }
+
+  const blocks = text.match(/<User(?:\s[^>]*)?>[\s\S]*?<\/User>/gi) || [];
+  return blocks.map((block) => ({
+    Id: xmlTagValue(block, "Id"),
+    Login: xmlTagValue(block, "Login"),
+    Name: xmlTagValue(block, "Name"),
+  }));
+}
+
+async function findIntraServiceExecutorId(megafonUser) {
+  const login = String(megafonUser || "").trim();
+  if (!login) {
+    throw new Error("MegaFon employee login is missing; cannot determine IntraService executor");
+  }
+
+  const params = new URLSearchParams({
+    serviceid: String(IS_SERVICE_ID),
+    fields: "Id,Login,Name",
+    search: login,
+    pagesize: "50",
+    page: "1",
+  });
+
+  const { response, responseText } = await intraserviceRequest(
+    "GET",
+    `/api/taskexecutor?${params.toString()}`,
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      `IntraService executor search HTTP ${response.status}: ${responseText.slice(0, 2000)}`,
+    );
+  }
+
+  const users = extractUsers(responseText);
+  const exactMatches = users.filter(
+    (user) =>
+      String(user?.Login ?? user?.login ?? "").trim().toLowerCase() === login.toLowerCase(),
+  );
+
+  if (exactMatches.length === 1) {
+    const executorId = exactMatches[0]?.Id ?? exactMatches[0]?.id;
+    const executorName = exactMatches[0]?.Name ?? exactMatches[0]?.name ?? "";
+    if (executorId != null && String(executorId).trim()) {
+      log("info", "IntraService executor resolved from MegaFon employee", {
+        megafonUser: login,
+        executorId: String(executorId),
+        executorName,
+      });
+      return String(executorId);
+    }
+  }
+
+  if (exactMatches.length > 1) {
+    throw new Error(
+      `Multiple IntraService executors matched MegaFon employee login "${login}"`,
+    );
+  }
+
+  throw new Error(`IntraService executor not found for MegaFon employee login "${login}"`);
+}
+async function createIntraServiceTask({
+  phone,
+  duration,
+  recordUrl,
+  callid,
+  callStart,
+  megafonUser,
+}) {
   const existingBefore = await findExistingIntraServiceTask(callid);
   if (existingBefore) {
     log("info", "Existing IntraService task found before POST", { callid, taskId: existingBefore });
     return existingBefore;
   }
+
+  const executorId = await findIntraServiceExecutorId(megafonUser);
 
   const description = [
     `Номер клиента: ${phone || "не указан"}`,
@@ -371,7 +452,7 @@ async function createIntraServiceTask({ phone, duration, recordUrl, callid, call
     PriorityId: IS_PRIORITY_ID,
     StatusId: IS_STATUS_DONE_ID,
     CreatorId: IS_CREATOR_ID,
-    ExecutorIds: String(IS_EXECUTOR_ID),
+    ExecutorIds: String(executorId),
   };
 
   const { response, responseText } = await intraserviceRequest("POST", "/api/task", body);
