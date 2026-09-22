@@ -152,6 +152,7 @@ function parseHistoryPayload(payload) {
       callid,
       phone: normalizePhone(payload?.phone || payload?.client),
       megafon_user: String(payload?.user || "").trim(),
+      megafon_user_name: String(payload?.user_name || "").trim(),
       duration,
       record_url: safeUrl(payload?.link || payload?.record),
       call_start: String(payload?.start || "").trim(),
@@ -167,6 +168,7 @@ function skippedCall(payload, callid, reason, durationOverride) {
     callid,
     phone: normalizePhone(payload?.phone || payload?.client),
     megafon_user: String(payload?.user || "").trim(),
+    megafon_user_name: String(payload?.user_name || "").trim(),
     duration: durationOverride ?? parseNonNegativeInt(payload?.duration),
     record_url: safeUrl(payload?.link || payload?.record),
     call_start: String(payload?.start || "").trim(),
@@ -242,6 +244,7 @@ async function processCall(callid, fromStatus = "RECEIVED") {
       callid: row.callid,
       callStart: row.call_start,
       megafonUser: row.megafon_user,
+      megafonUserName: row.megafon_user_name,
     });
 
     if (!taskId) throw new Error("IntraService task ID missing after create/reconciliation");
@@ -368,58 +371,92 @@ function extractUsers(text) {
   }));
 }
 
-async function findIntraServiceExecutorId(megafonUser) {
+function normalizeMatchText(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+async function findIntraServiceExecutorId(megafonUser, megafonUserName) {
   const login = String(megafonUser || "").trim();
-  if (!login) {
-    throw new Error("MegaFon employee login is missing; cannot determine IntraService executor");
+  const displayName = String(megafonUserName || "").trim();
+  if (!login && !displayName) {
+    throw new Error("MegaFon employee login/name is missing; cannot determine IntraService executor");
   }
 
-  const params = new URLSearchParams({
-    serviceid: String(IS_SERVICE_ID),
-    fields: "Id,Login,Name",
-    search: login,
-    pagesize: "50",
-    page: "1",
-  });
+  const fetchExecutors = async (search) => {
+    const params = new URLSearchParams({
+      serviceid: String(IS_SERVICE_ID),
+      fields: "Id,Login,Name",
+      pagesize: "2000",
+      page: "1",
+    });
+    if (search) params.set("search", search);
 
-  const { response, responseText } = await intraserviceRequest(
-    "GET",
-    `/api/taskexecutor?${params.toString()}`,
-  );
-
-  if (!response.ok) {
-    throw new Error(
-      `IntraService executor search HTTP ${response.status}: ${responseText.slice(0, 2000)}`,
+    const { response, responseText } = await intraserviceRequest(
+      "GET",
+      `/api/taskexecutor?${params.toString()}`,
     );
-  }
 
-  const users = extractUsers(responseText);
-  const exactMatches = users.filter(
-    (user) =>
-      String(user?.Login ?? user?.login ?? "").trim().toLowerCase() === login.toLowerCase(),
-  );
+    if (!response.ok) {
+      throw new Error(
+        `IntraService executor search HTTP ${response.status}: ${responseText.slice(0, 2000)}`,
+      );
+    }
+    return extractUsers(responseText);
+  };
 
-  if (exactMatches.length === 1) {
-    const executorId = exactMatches[0]?.Id ?? exactMatches[0]?.id;
-    const executorName = exactMatches[0]?.Name ?? exactMatches[0]?.name ?? "";
-    if (executorId != null && String(executorId).trim()) {
-      log("info", "IntraService executor resolved from MegaFon employee", {
-        megafonUser: login,
-        executorId: String(executorId),
-        executorName,
-      });
-      return String(executorId);
+  if (login) {
+    const loginUsers = await fetchExecutors(login);
+    const exactLogin = loginUsers.filter(
+      (user) => normalizeMatchText(user?.Login ?? user?.login) === normalizeMatchText(login),
+    );
+
+    if (exactLogin.length === 1) {
+      const executorId = exactLogin[0]?.Id ?? exactLogin[0]?.id;
+      const executorName = exactLogin[0]?.Name ?? exactLogin[0]?.name ?? "";
+      if (executorId != null && String(executorId).trim()) {
+        log("info", "IntraService executor resolved by login", {
+          megafonUser: login,
+          executorId: String(executorId),
+          executorName,
+        });
+        return String(executorId);
+      }
     }
   }
 
-  if (exactMatches.length > 1) {
-    throw new Error(
-      `Multiple IntraService executors matched MegaFon employee login "${login}"`,
+  if (displayName) {
+    const nameUsers = await fetchExecutors(displayName);
+    const exactName = nameUsers.filter(
+      (user) => normalizeMatchText(user?.Name ?? user?.name) === normalizeMatchText(displayName),
     );
+
+    if (exactName.length === 1) {
+      const executorId = exactName[0]?.Id ?? exactName[0]?.id;
+      const executorLogin = exactName[0]?.Login ?? exactName[0]?.login ?? "";
+      if (executorId != null && String(executorId).trim()) {
+        log("info", "IntraService executor resolved by employee name", {
+          megafonUser: login,
+          megafonUserName: displayName,
+          executorId: String(executorId),
+          executorLogin,
+        });
+        return String(executorId);
+      }
+    }
+
+    if (exactName.length > 1) {
+      throw new Error(`Multiple IntraService executors matched MegaFon employee name "${displayName}"`);
+    }
   }
 
-  throw new Error(`IntraService executor not found for MegaFon employee login "${login}"`);
+  throw new Error(
+    `IntraService executor not found for MegaFon employee "${login || displayName}"`,
+  );
 }
+
 async function createIntraServiceTask({
   phone,
   duration,
@@ -427,6 +464,7 @@ async function createIntraServiceTask({
   callid,
   callStart,
   megafonUser,
+  megafonUserName,
 }) {
   const existingBefore = await findExistingIntraServiceTask(callid);
   if (existingBefore) {
@@ -434,7 +472,7 @@ async function createIntraServiceTask({
     return existingBefore;
   }
 
-  const executorId = await findIntraServiceExecutorId(megafonUser);
+  const executorId = await findIntraServiceExecutorId(megafonUser, megafonUserName);
 
   const description = [
     `Номер клиента: ${phone || "не указан"}`,
@@ -550,6 +588,7 @@ async function reconcileHistory() {
         phone: item?.phone,
         client: item?.client,
         user: item?.user,
+        user_name: item?.user_name,
         duration: item?.duration,
         record: item?.record,
         start: item?.start,
