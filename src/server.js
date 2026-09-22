@@ -200,15 +200,16 @@ function safePayloadSummary(payload) {
 async function insertCall(call) {
   const result = await pool.query(
     `INSERT INTO calls
-      (callid, phone, megafon_user, duration, record_url, call_start,
+      (callid, phone, megafon_user, megafon_user_name, duration, record_url, call_start,
        call_type, call_status, status, error_type, error_message, updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
      ON CONFLICT (callid) DO NOTHING
      RETURNING id`,
     [
       call.callid,
       call.phone,
       call.megafon_user,
+      call.megafon_user_name || "",
       call.duration,
       call.record_url,
       call.call_start,
@@ -591,6 +592,14 @@ async function reconcileHistory() {
       });
       if (!parsed.ok) continue;
       const inserted = await insertCall(parsed.data);
+
+      if (parsed.data.megafon_user_name) {
+        await pool.query(
+          "UPDATE calls SET megafon_user_name=$1 WHERE callid=$2 AND (megafon_user_name IS NULL OR megafon_user_name='')",
+          [parsed.data.megafon_user_name, parsed.data.callid],
+        );
+      }
+
       if (inserted && parsed.data.status === "RECEIVED") {
         await processCall(parsed.data.callid);
       }
@@ -630,6 +639,13 @@ const server = http.createServer(async (req, res) => {
     if (!parsed.ok) return jsonResponse(res, 200, { result: "ignored", reason: parsed.reason });
 
     const inserted = await insertCall(parsed.data);
+    if (parsed.data.megafon_user_name) {
+      await pool.query(
+        "UPDATE calls SET megafon_user_name=$1 WHERE callid=$2 AND (megafon_user_name IS NULL OR megafon_user_name='')",
+        [parsed.data.megafon_user_name, parsed.data.callid],
+      );
+    }
+
     if (inserted && parsed.data.status === "RECEIVED") {
       await processCall(parsed.data.callid);
       return jsonResponse(res, 200, { result: "accepted", callid: parsed.data.callid });
