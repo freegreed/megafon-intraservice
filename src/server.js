@@ -566,7 +566,7 @@ async function findExistingIntraServiceExpense(taskId, callid) {
     );
   }
 
-  const expenses = extractExpenses(responseText);
+  const expenses = await extractExpenses(responseText);
   const marker = `Call ID: ${callid}`;
   return (
     expenses.find((expense) =>
