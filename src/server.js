@@ -250,6 +250,14 @@ async function processCall(callid, fromStatus = "RECEIVED") {
 
     if (!taskId) throw new Error("IntraService task ID missing after create/reconciliation");
 
+    await addCallDurationExpense({
+      taskId,
+      durationSec: row.duration,
+      callid: row.callid,
+      megafonUser: row.megafon_user,
+      megafonUserName: row.megafon_user_name,
+    });
+
     await pool.query(
       `UPDATE calls SET status='CREATED', intraservice_task_id=$1,
        error_type=NULL, error_message=NULL, next_retry_at=NULL,
@@ -507,6 +515,130 @@ async function createIntraServiceTask({
     throw new Error(`IntraService task created but ID could not be extracted: ${responseText.slice(0, 2000)}`);
   }
   return taskId;
+}
+
+async function extractExpenses(text) {
+  if (!text) return [];
+
+  try {
+    const data = JSON.parse(text);
+    const expenses =
+      data?.Expenses ??
+      data?.expenses ??
+      data?.TaskExpenses ??
+      data?.taskExpenses;
+
+    if (Array.isArray(expenses)) return expenses;
+    if (data?.Expense) return [data.Expense];
+    if (data?.expense) return [data.expense];
+  } catch {
+    // XML fallback below.
+  }
+
+  const blocks = text.match(/<Expense(?:\s[^>]*)?>[\s\S]*?<\/Expense>/gi) || [];
+  return blocks.map((block) => ({
+    Id: xmlTagValue(block, "Id"),
+    UserId: xmlTagValue(block, "UserId"),
+    UserName: xmlTagValue(block, "UserName"),
+    Date: xmlTagValue(block, "Date"),
+    Minutes: xmlTagValue(block, "Minutes"),
+    Comments: xmlTagValue(block, "Comments"),
+    TaskId: xmlTagValue(block, "TaskId"),
+  }));
+}
+
+async function findExistingIntraServiceExpense(taskId, callid) {
+  const params = new URLSearchParams({
+    taskid: String(taskId),
+    fields: "Id,UserId,UserName,Date,Minutes,Comments,TaskId",
+    pagesize: "200",
+    page: "1",
+  });
+
+  const { response, responseText } = await intraserviceRequest(
+    "GET",
+    `/api/taskexpenses?${params.toString()}`,
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      `IntraService task expenses search HTTP ${response.status}: ${responseText.slice(0, 2000)}`,
+    );
+  }
+
+  const expenses = extractExpenses(responseText);
+  const marker = `Call ID: ${callid}`;
+  return (
+    expenses.find((expense) =>
+      String(expense?.Comments ?? expense?.comments ?? "").includes(marker),
+    ) || null
+  );
+}
+
+async function addCallDurationExpense({
+  taskId,
+  durationSec,
+  callid,
+  megafonUser,
+  megafonUserName,
+}) {
+  const existing = await findExistingIntraServiceExpense(taskId, callid);
+  if (existing) {
+    log("info", "Existing IntraService labor cost found", {
+      callid,
+      taskId: String(taskId),
+      expenseId: String(existing?.Id ?? existing?.id ?? ""),
+      minutes: Number(existing?.Minutes ?? existing?.minutes ?? 0),
+    });
+    return existing;
+  }
+
+  const executorId = await findIntraServiceExecutorId(megafonUser, megafonUserName);
+  const minutes = Math.max(1, Math.ceil(Number(durationSec || 0) / 60));
+  const comments = `Телефонный разговор: ${Number(durationSec || 0)} сек. Call ID: ${callid}`;
+
+  const body = {
+    TaskId: Number(taskId),
+    Minutes: minutes,
+    UserId: Number(executorId),
+    Comments: comments,
+  };
+
+  const { response, responseText } = await intraserviceRequest(
+    "POST",
+    "/api/taskexpenses",
+    body,
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      `IntraService labor cost HTTP ${response.status}: ${responseText.slice(0, 2000)}`,
+    );
+  }
+
+  let created = null;
+  try {
+    created = JSON.parse(responseText);
+  } catch {
+    // Response may be empty on success.
+  }
+
+  const expenseId =
+    created?.Id ??
+    created?.id ??
+    created?.Expense?.Id ??
+    created?.expense?.Id ??
+    "";
+
+  log("info", "IntraService labor cost created", {
+    callid,
+    taskId: String(taskId),
+    executorId: String(executorId),
+    minutes,
+    expenseId: expenseId ? String(expenseId) : null,
+  });
+
+  return created || { TaskId: Number(taskId), UserId: Number(executorId), Minutes: minutes };
 }
 
 async function scheduleRetry(callid, errorType, message) {
